@@ -1,0 +1,4 @@
+[workspace]
+members = ["server", "migration", "entity"]
+resolver = "2"
+default-members = ["server"]
