@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.86"
-axum = "0.7.5"
+axum = { version = "0.7.5", features = ["macros"] }
 config = "0.14.0"
 google-gmail1 = "5.0.5"
 lazy_static = "1.5.0"
@@ -27,10 +27,12 @@ chrono = "0.4.38"
 tokio-cron-scheduler = { version = "0.13.0", features = ["signal"] }
 futures = "0.3.30"
 mimalloc = "0.1.43"
-arl = "0.2.0"
 mail-parser = "0.9.4"
 regex = "1.10.6"
 tokenizers = { version = "0.20.0", features = ["http"] }
+lettre = "0.11.9"
+leaky-bucket = "1.1.2"
+minijinja = "2.3.1"
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

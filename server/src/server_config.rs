@@ -1,8 +1,7 @@
 use config::{Config, ConfigError};
-use google_gmail1::oauth2::{read_application_secret, ApplicationSecret};
 use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::{collections::HashSet, result::Result};
+use std::result::Result;
 
 #[derive(Debug, Deserialize)]
 pub struct GmailConfig {
@@ -26,25 +25,41 @@ impl GmailConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Category {
+    pub ai: String,
+    pub mail_label: String,
+    pub gmail_categories: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     ai_api_key: String,
-    category_labels: Vec<String>,
+    categories: Vec<Category>,
+    prompt_rate_limit_per_min: u64,
+    token_rate_limit_per_min: u64,
+    daily_user_quota: u64,
+    model_temperature: f64,
+    estimated_token_usage_per_email: u64,
 }
 
 pub struct ServerConfig {
     pub ai_api_key: String,
-    pub ai_categories: Vec<String>,
+    pub categories: Vec<Category>,
     pub gmail_config: GmailConfig,
-    // pub app_secret: ApplicationSecret,
+    pub prompt_rate_limit_per_min: u64,
+    pub token_rate_limit_per_min: u64,
+    pub daily_user_quota: u64,
+    pub model_temperature: f64,
+    pub estimated_token_usage_per_email: u64,
 }
 
 impl std::fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ai_api_key: {}, ai_categories: {:?}, gmail_config: {:?}",
-            self.ai_api_key, self.ai_categories, self.gmail_config
+            "ai_api_key: {}, categories: {:?}, gmail_config: {:?}",
+            self.ai_api_key, self.categories, self.gmail_config
         )
     }
 }
@@ -62,10 +77,35 @@ lazy_static! {
             .try_deserialize()
             .expect("config.toml is invalid");
 
+        let ConfigFile {
+            ai_api_key,
+            categories,
+            prompt_rate_limit_per_min,
+            token_rate_limit_per_min,
+            daily_user_quota,
+            model_temperature,
+            estimated_token_usage_per_email,
+        } = server_config;
+
         ServerConfig {
-            ai_api_key: server_config.ai_api_key,
-            ai_categories: server_config.category_labels,
+            ai_api_key,
+            categories,
             gmail_config,
+            prompt_rate_limit_per_min,
+            token_rate_limit_per_min,
+            daily_user_quota,
+            model_temperature,
+            estimated_token_usage_per_email,
         }
+    };
+    pub static ref UNKNOWN_CATEGORY: Category = Category {
+        ai: "Unknown".to_string(),
+        mail_label: "mailclerk:uncategorized".to_string(),
+        gmail_categories: vec![],
+    };
+    pub static ref DAILY_SUMMARY_CATEGORY: Category = Category {
+        ai: "".to_string(),
+        mail_label: "mailclerk:daily_summary".to_string(),
+        gmail_categories: vec![],
     };
 }

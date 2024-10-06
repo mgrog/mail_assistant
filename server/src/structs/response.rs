@@ -16,3 +16,9 @@ pub struct GmailApiRefreshTokenResponse {
     pub expires_in: u64,
     pub scope: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LabelUpdate {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}

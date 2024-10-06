@@ -1,8 +1,9 @@
 #[macro_use]
 mod macros;
 
-mod email_client;
-mod email_proc;
+mod api_quota;
+mod email;
+mod rate_limiters;
 mod request_tracing;
 mod routes;
 mod server_config;
@@ -15,14 +16,15 @@ use std::{
     time::Duration,
 };
 
-use arl::RateLimiter;
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
-use email_proc::EmailProcessor;
+// use arl::RateLimiter;
+use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, routing::get, Router};
 use futures::future::join_all;
+use leaky_bucket::RateLimiter;
 use mimalloc::MiMalloc;
-use sea_orm::{Database, DatabaseConnection};
+use rate_limiters::RateLimiters;
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use server_config::CONFIG;
 use std::sync::atomic::Ordering::Relaxed;
-use tokenizers::Tokenizer;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tower_cookies::CookieManagerLayer;
@@ -33,18 +35,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub type TokenCounter = Arc<AtomicU64>;
+pub type HttpClient = reqwest::Client;
 
-#[derive(Clone)]
+#[derive(Clone, FromRef)]
 struct ServerState {
-    http_client: reqwest::Client,
+    http_client: HttpClient,
     conn: DatabaseConnection,
     token_count: TokenCounter,
-    tokenizer: Tokenizer,
+    rate_limiters: RateLimiters,
 }
 
 impl ServerState {
-    fn add_global_token_count(&self, count: u64) {
-        self.token_count.fetch_add(count, Relaxed);
+    fn add_global_token_count(&self, count: i64) {
+        self.token_count.fetch_add(count as u64, Relaxed);
     }
 }
 
@@ -53,16 +56,18 @@ async fn main() -> anyhow::Result<()> {
     env::set_var("RUST_LOG", "info");
     dotenvy::dotenv().ok();
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL is not set in .env file");
-    let conn = Database::connect(db_url)
+    let mut db_options = ConnectOptions::new(db_url);
+    db_options.sqlx_logging(false);
+
+    let conn = Database::connect(db_options)
         .await
         .expect("Database connection failed");
-    let tokenizer = Tokenizer::from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct", None)
-        .expect("Failed to load tokenizer");
+
     let state = ServerState {
         http_client: reqwest::Client::new(),
         conn,
         token_count: Arc::new(AtomicU64::new(0)),
-        tokenizer,
+        rate_limiters: RateLimiters::from_env(),
     };
 
     tracing_subscriber::registry()
@@ -71,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let router = Router::new()
-        .route("/", get(|| async { "Auto mail server" }))
+        .route("/", get(|| async { "Auto email server" }))
         .route("/auth", get(routes::auth::handler_auth_gmail))
         .route(
             "/auth/callback",
@@ -91,17 +96,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Failed to create scheduler");
 
-    let prompt_rate_limiter = RateLimiter::new(15, Duration::from_secs(60));
-
     {
-        let state = state.clone();
+        let state_clone = state.clone();
+        // This is a one shot just for testing
         scheduler
             .add(Job::new_one_shot_async(
                 Duration::from_secs(0),
                 move |uuid, mut l: JobScheduler| {
-                    let state = state.clone();
+                    let state = state_clone.clone();
                     Box::pin(async move {
-                        match email_proc::process_emails(state).await {
+                        match email::process_emails(state).await {
                             Ok(_) => {
                                 tracing::info!("Email processor job {} succeeded", uuid);
                             }
@@ -116,6 +120,26 @@ async fn main() -> anyhow::Result<()> {
                                 println!("Next time for email processor job is {:?}", ts)
                             }
                             _ => println!("Could not get next tick for email processor job"),
+                        }
+                    })
+                },
+            )?)
+            .await?;
+
+        let state_clone = state.clone();
+        scheduler
+            .add(Job::new_one_shot_async(
+                Duration::from_secs(0),
+                move |uuid, mut _l: JobScheduler| {
+                    let conn = state_clone.conn.clone();
+                    Box::pin(async move {
+                        match email::send_daily_email_summaries(conn.clone()).await {
+                            Ok(_) => {
+                                tracing::info!("Daily summary mailer job {} succeeded", uuid);
+                            }
+                            Err(e) => {
+                                tracing::error!("Job failed: {:?}", e);
+                            }
                         }
                     })
                 },

@@ -47,13 +47,17 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
+            .drop_index(Index::drop().name("idx-user_session_email").to_owned())
+            .await?;
+
+        manager
             .drop_table(Table::drop().table(UserSession::Table).to_owned())
             .await
     }
 }
 
 #[derive(DeriveIden)]
-enum UserSession {
+pub enum UserSession {
     Table,
     Id,
     Email,

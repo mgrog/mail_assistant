@@ -21,13 +21,13 @@ use serde_json::json;
 use user_session::Column::*;
 
 use crate::{
-    email_client::{self, EmailClient},
+    email::EmailClient,
     server_config::{GmailConfig, CONFIG},
     structs::{
         error::{AppError, AppJsonResult, AppResult},
         response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
     },
-    ServerState,
+    HttpClient, ServerState,
 };
 
 async fn browser_user_url(url: &str, need_code: bool) -> Result<String, String> {
@@ -78,7 +78,7 @@ impl InstalledFlowDelegate for InstalledFlowBrowserDelegate {
 // }
 
 pub async fn handler_auth_gmail(
-    State(state): State<ServerState>,
+    State(http_client): State<HttpClient>,
 ) -> AppJsonResult<serde_json::Value> {
     let GmailConfig {
         auth_uri,
@@ -87,7 +87,6 @@ pub async fn handler_auth_gmail(
         scopes,
         ..
     } = &CONFIG.gmail_config;
-    let ServerState { http_client, .. } = state;
 
     let req = http_client
         .get(auth_uri)
