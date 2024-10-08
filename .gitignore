@@ -1,3 +1,6 @@
 db
 .env*
 target
+.aws
+cert.pem
+ssl.pem

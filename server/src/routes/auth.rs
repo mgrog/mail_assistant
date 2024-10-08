@@ -1,9 +1,4 @@
 extern crate google_gmail1 as gmail;
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
 
 use anyhow::Context;
 use axum::{
@@ -12,70 +7,20 @@ use axum::{
 };
 use chrono::DateTime;
 use entity::user_session;
-use google_gmail1::oauth2::authenticator_delegate::{
-    DefaultInstalledFlowDelegate, InstalledFlowDelegate,
-};
 use sea_orm::{sea_query::OnConflict, ActiveValue, EntityTrait};
 use serde::Deserialize;
 use serde_json::json;
 use user_session::Column::*;
 
 use crate::{
-    email::EmailClient,
-    server_config::{GmailConfig, CONFIG},
+    email::client::EmailClient,
+    server_config::{cfg, GmailConfig},
     structs::{
         error::{AppError, AppJsonResult, AppResult},
         response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
     },
     HttpClient, ServerState,
 };
-
-async fn browser_user_url(url: &str, need_code: bool) -> Result<String, String> {
-    let def_delegate = DefaultInstalledFlowDelegate;
-    def_delegate.present_user_url(url, need_code).await
-}
-
-#[derive(Clone)]
-struct InstalledFlowBrowserDelegate {
-    url: Arc<Mutex<String>>,
-}
-
-impl InstalledFlowDelegate for InstalledFlowBrowserDelegate {
-    fn present_user_url<'a>(
-        &'a self,
-        url: &'a str,
-        need_code: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        self.url.lock().unwrap().push_str(url);
-        Box::pin(browser_user_url(url, need_code))
-    }
-
-    fn redirect_uri(&self) -> Option<&str> {
-        None
-    }
-}
-
-// pub async fn handler_auth_gmail(
-//     State(state): State<ServerState>,
-// ) -> AppJsonResult<serde_json::Value> {
-//     let secret = CONFIG.app_secret.clone();
-//     let flow_delegate = InstalledFlowBrowserDelegate {
-//         url: Arc::new(Mutex::new(String::new())),
-//     };
-//     let redirect_uri = flow_delegate.url.clone();
-//     let auth = InstalledFlowAuthenticator::builder(
-//         secret,
-//         oauth2::InstalledFlowReturnMethod::HTTPPortRedirect(8080),
-//     )
-//     .flow_delegate(Box::new(flow_delegate))
-//     .build()
-//     .await
-//     .context("Failed to create authenticator")?;
-
-//     Ok(Json(json!({
-//         "url": redirect_uri.lock().unwrap().clone()
-//     })))
-// }
 
 pub async fn handler_auth_gmail(
     State(http_client): State<HttpClient>,
@@ -86,7 +31,7 @@ pub async fn handler_auth_gmail(
         redirect_uris,
         scopes,
         ..
-    } = &CONFIG.gmail_config;
+    } = &cfg.gmail_config;
 
     let req = http_client
         .get(auth_uri)
@@ -106,6 +51,7 @@ pub async fn handler_auth_gmail(
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct CallbackQuery {
     pub code: Option<String>,
     pub error: Option<String>,
@@ -131,7 +77,7 @@ pub async fn handler_auth_gmail_callback(
         client_secret,
         redirect_uris,
         ..
-    } = &CONFIG.gmail_config;
+    } = &cfg.gmail_config;
 
     let resp = state
         .http_client
@@ -155,7 +101,9 @@ pub async fn handler_auth_gmail_callback(
     let email_client =
         EmailClient::new(state.http_client.clone(), resp.access_token.clone()).await?;
     let profile = email_client.get_profile().await?;
-    println!("Profile: {:?}", profile);
+    // -- DEBUG
+    // println!("Profile: {:?}", profile);
+    // -- DEBUG
     let email = profile
         .email_address
         .context("Profile email not found. An email address is required")?;
@@ -200,7 +148,7 @@ pub async fn exchange_refresh_token(
         client_id,
         client_secret,
         ..
-    } = &CONFIG.gmail_config;
+    } = &cfg.gmail_config;
 
     let resp = http_client
         .post(token_uri)

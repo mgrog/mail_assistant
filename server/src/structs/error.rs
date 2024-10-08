@@ -1,3 +1,4 @@
+use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -5,10 +6,13 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::server_config::cfg;
+
 pub type AppResult<T> = Result<T, AppError>;
 pub type AppJsonResult<T> = AppResult<Json<T>>;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AppError {
     NotFound(String),
     BadRequest(String),
@@ -17,6 +21,7 @@ pub enum AppError {
     TooManyRequests,
     Unauthorized(String),
     DbError(sea_orm::error::DbErr),
+    AiPrompt(BedrockConverseError),
 }
 
 impl From<anyhow::Error> for AppError {
@@ -39,6 +44,44 @@ impl From<reqwest::Error> for AppError {
 impl From<sea_orm::error::DbErr> for AppError {
     fn from(error: sea_orm::error::DbErr) -> Self {
         AppError::DbError(error)
+    }
+}
+
+impl From<BedrockConverseError> for AppError {
+    fn from(error: BedrockConverseError) -> Self {
+        AppError::AiPrompt(error)
+    }
+}
+
+impl From<&ConverseError> for AppError {
+    fn from(error: &ConverseError) -> Self {
+        AppError::AiPrompt(error.into())
+    }
+}
+
+#[derive(Debug)]
+pub struct BedrockConverseError(pub String);
+impl std::fmt::Display for BedrockConverseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Can't invoke '{}'. Reason: {}", cfg.model.id, self.0)
+    }
+}
+impl std::error::Error for BedrockConverseError {}
+impl From<&str> for BedrockConverseError {
+    fn from(value: &str) -> Self {
+        BedrockConverseError(value.to_string())
+    }
+}
+impl From<&ConverseError> for BedrockConverseError {
+    fn from(value: &ConverseError) -> Self {
+        BedrockConverseError::from(match value {
+            ConverseError::ModelTimeoutException(_) => "Model took too long",
+            ConverseError::ModelNotReadyException(_) => "Model is not ready",
+            _ => {
+                tracing::error!("Unknown error: {:?}", value);
+                "Unknown"
+            }
+        })
     }
 }
 
@@ -104,6 +147,16 @@ impl IntoResponse for AppError {
                     Json(json!({"error": {
                         "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                         "message": "Database error"
+                    }})),
+                )
+            }
+            AppError::AiPrompt(err) => {
+                tracing::error!("Error: {:?}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": {
+                        "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        "message": "AI prompt error"
                     }})),
                 )
             }

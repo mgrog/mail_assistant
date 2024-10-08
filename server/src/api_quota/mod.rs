@@ -1,3 +1,3 @@
 mod gmail;
 
-pub use gmail::*;
+pub(crate) use gmail::*;

@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::result::Result;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct GmailConfig {
     pub client_id: String,
     pub project_id: String,
@@ -32,6 +33,13 @@ pub struct Category {
     pub gmail_categories: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    pub id: String,
+    pub region: String,
+    pub temperature: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     ai_api_key: String,
@@ -39,8 +47,8 @@ struct ConfigFile {
     prompt_rate_limit_per_min: u64,
     token_rate_limit_per_min: u64,
     daily_user_quota: u64,
-    model_temperature: f64,
     estimated_token_usage_per_email: u64,
+    model: ModelConfig,
 }
 
 pub struct ServerConfig {
@@ -50,8 +58,8 @@ pub struct ServerConfig {
     pub prompt_rate_limit_per_min: u64,
     pub token_rate_limit_per_min: u64,
     pub daily_user_quota: u64,
-    pub model_temperature: f64,
     pub estimated_token_usage_per_email: u64,
+    pub model: ModelConfig,
 }
 
 impl std::fmt::Display for ServerConfig {
@@ -65,12 +73,12 @@ impl std::fmt::Display for ServerConfig {
 }
 
 lazy_static! {
-    pub static ref CONFIG: ServerConfig = {
+    pub static ref cfg: ServerConfig = {
         let root = env!("CARGO_MANIFEST_DIR");
         let path = format!("{root}/client_secret.toml");
         let gmail_config = GmailConfig::from_file(&path).expect("client_secret.toml is required");
         let path = format!("{root}/config.toml");
-        let server_config: ConfigFile = Config::builder()
+        let cfg_file: ConfigFile = Config::builder()
             .add_source(config::File::with_name(&path))
             .build()
             .expect("config.toml is required")
@@ -83,9 +91,9 @@ lazy_static! {
             prompt_rate_limit_per_min,
             token_rate_limit_per_min,
             daily_user_quota,
-            model_temperature,
             estimated_token_usage_per_email,
-        } = server_config;
+            model,
+        } = cfg_file;
 
         ServerConfig {
             ai_api_key,
@@ -94,8 +102,8 @@ lazy_static! {
             prompt_rate_limit_per_min,
             token_rate_limit_per_min,
             daily_user_quota,
-            model_temperature,
             estimated_token_usage_per_email,
+            model,
         }
     };
     pub static ref UNKNOWN_CATEGORY: Category = Category {

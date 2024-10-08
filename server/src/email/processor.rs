@@ -11,9 +11,10 @@ use sea_orm::{entity::*, prelude::Expr, query::*, ActiveValue, EntityTrait};
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::{
-    email::{client::EmailClient, prompt, CategoryPromptResponse},
+    email::client::EmailClient,
+    prompt::{self, CategoryPromptResponse},
     routes::auth,
-    server_config::{CONFIG, UNKNOWN_CATEGORY},
+    server_config::{cfg, UNKNOWN_CATEGORY},
     structs::error::{AppError, AppResult},
     ServerState,
 };
@@ -69,7 +70,7 @@ impl EmailProcessor {
             .map(|usage| usage.tokens_consumed)
             .unwrap_or(0);
 
-        let remaining_quota = CONFIG.daily_user_quota as i64 - quota_used;
+        let remaining_quota = cfg.daily_user_quota as i64 - quota_used;
 
         // -- Debug
         println!(
@@ -111,6 +112,7 @@ impl EmailProcessor {
             .messages
             .context("No messages found")?
             .into_iter()
+            .take(1)
             .map(|email_message| {
                 let server_state = self.server_state.clone();
                 let user_token_count = self.token_count.clone();
@@ -144,42 +146,52 @@ impl EmailProcessor {
                     // Acquire rate limiter tokens
                     server_state
                         .rate_limiters
-                        .acquire(1000) // 1000 tokens per email is a reasonable estimate
+                        .acquire(cfg.estimated_token_usage_per_email as usize)
                         .await;
 
                     let CategoryPromptResponse {
                         category,
                         token_usage,
-                    } = prompt::send_category_prompt_rate_limited(&server_state, email_message)
-                        .await?;
+                    } = match prompt::send_category_prompt_rate_limited(
+                        &server_state,
+                        email_message,
+                    )
+                    .await
+                    {
+                        Ok(resp) => Ok::<_, AppError>(resp),
+                        Err(e) => {
+                            tracing::error!("Error processing email {}: {:?}", email_id, e);
+                            return Err::<_, AppError>(e);
+                        }
+                    }?;
 
                     // Add to specific user token count for quota
                     user_token_count.fetch_add(token_usage, Relaxed);
                     // Add to total token count
                     server_state.add_global_token_count(token_usage);
 
-                    let label_category = CONFIG
-                        .categories
-                        .iter()
-                        .find(|c| c.ai == category)
-                        .unwrap_or(&UNKNOWN_CATEGORY);
+                    // let label_category = cfg
+                    //     .categories
+                    //     .iter()
+                    //     .find(|c| c.ai == category)
+                    //     .unwrap_or(&UNKNOWN_CATEGORY);
 
-                    let label_update = self
-                        .email_client
-                        .label_email(email_id.clone(), current_labels, label_category.clone())
-                        .await?;
+                    // let label_update = self
+                    //     .email_client
+                    //     .label_email(email_id.clone(), current_labels, label_category.clone())
+                    //     .await?;
 
-                    ProcessedEmail::insert(processed_email::ActiveModel {
-                        id: ActiveValue::Set(email_id),
-                        user_session_id: ActiveValue::Set(self.user_session_id),
-                        user_session_email: ActiveValue::Set(self.email.clone()),
-                        labels_applied: ActiveValue::Set(label_update.added),
-                        labels_removed: ActiveValue::Set(label_update.removed),
-                        ai_answer: ActiveValue::Set(category),
-                        processed_at: ActiveValue::NotSet,
-                    })
-                    .exec(&server_state.conn)
-                    .await?;
+                    // ProcessedEmail::insert(processed_email::ActiveModel {
+                    //     id: ActiveValue::Set(email_id),
+                    //     user_session_id: ActiveValue::Set(self.user_session_id),
+                    //     user_session_email: ActiveValue::Set(self.email.clone()),
+                    //     labels_applied: ActiveValue::Set(label_update.added),
+                    //     labels_removed: ActiveValue::Set(label_update.removed),
+                    //     ai_answer: ActiveValue::Set(category),
+                    //     processed_at: ActiveValue::NotSet,
+                    // })
+                    // .exec(&server_state.conn)
+                    // .await?;
 
                     self.processed_email_count.fetch_add(1, Relaxed);
 
@@ -204,7 +216,7 @@ impl EmailProcessor {
             join_all(chunk).await;
         }
 
-        self.add_tally_to_user_daily_quota().await?;
+        // self.add_tally_to_user_daily_quota().await?;
 
         tracing::info!(
             "Email processing complete for {}, {} tokens used, {} emails processed",

@@ -17,18 +17,17 @@ use serde_json::json;
 
 use crate::{
     api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND},
-    server_config::{Category, CONFIG, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
+    server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
     structs::response::LabelUpdate,
 };
-
-pub(crate) const GMAIL_ENDPOINT: &str = "https://www.googleapis.com/gmail/v1/users/me";
 
 macro_rules! gmail_url {
     ($($params:expr),*) => {
         {
+            const GMAIL_ENDPOINT: &str = "https://www.googleapis.com/gmail/v1/users/me";
             let list_params = vec![$($params),*];
             let path = list_params.join("/");
-            format!("{}/{}", super::GMAIL_ENDPOINT, path)
+            format!("{}/{}", GMAIL_ENDPOINT, path)
         }
     };
 }
@@ -76,16 +75,33 @@ impl EmailClient {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_list)
             .await;
-        let label_set = CONFIG
+
+        // Add mailclerk labels to filter
+        let mut label_set = cfg
             .categories
             .iter()
             .map(|c| format!("label:{}", c.mail_label))
             .collect::<HashSet<_>>();
+
+        // Add special labels to filter
+        for mail_label in &[
+            UNKNOWN_CATEGORY.mail_label.clone(),
+            DAILY_SUMMARY_CATEGORY.mail_label.clone(),
+        ] {
+            label_set.insert(format!("label:{}", mail_label));
+        }
+
         let labels = vec!["label:inbox".to_string()]
             .into_iter()
             .chain(label_set)
             .collect::<Vec<_>>();
+
         let filter = labels.join(" AND NOT ");
+
+        // -- DEBUG
+        // println!("Filter: {}", filter);
+        // -- DEBUG
+
         let mut query = vec![
             ("q".to_string(), filter),
             ("maxResults".to_string(), "150".to_string()),
@@ -242,7 +258,7 @@ impl EmailClient {
             .collect::<Vec<_>>();
 
         // Configure labels if they need it
-        let mut required_labels = CONFIG
+        let mut required_labels = cfg
             .categories
             .iter()
             .map(|c| c.mail_label.to_string())
@@ -306,6 +322,7 @@ impl EmailClient {
         });
 
         // Remove old mailclerk labels that are no longer used
+        //? Maybe remove this in the future?
         let remove_label_tasks = unneeded_labels.into_iter().map(|label| async {
             let id = label.id.context("Label id not provided")?;
             self.delete_label(id).await

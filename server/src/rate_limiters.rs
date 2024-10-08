@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use leaky_bucket::RateLimiter;
 
-use crate::server_config::CONFIG;
+use crate::server_config::cfg;
 
 #[derive(Clone)]
 pub struct RateLimiters {
@@ -14,14 +14,14 @@ impl RateLimiters {
     pub fn from_env() -> Self {
         let duration_1_min = Duration::from_secs(60);
         let prompt = RateLimiter::builder()
-            .initial(CONFIG.prompt_rate_limit_per_min as usize)
+            .initial(cfg.prompt_rate_limit_per_min as usize)
             .interval(duration_1_min)
-            .refill(CONFIG.prompt_rate_limit_per_min as usize)
+            .refill(cfg.prompt_rate_limit_per_min as usize)
             .build();
         let token = RateLimiter::builder()
-            .initial(CONFIG.token_rate_limit_per_min as usize)
+            .initial(cfg.token_rate_limit_per_min as usize)
             .interval(duration_1_min)
-            .refill(CONFIG.token_rate_limit_per_min as usize)
+            .refill(cfg.token_rate_limit_per_min as usize)
             .build();
         Self {
             prompt: Arc::new(prompt),

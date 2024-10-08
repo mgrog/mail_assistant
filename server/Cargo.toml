@@ -33,6 +33,10 @@ tokenizers = { version = "0.20.0", features = ["http"] }
 lettre = "0.11.9"
 leaky-bucket = "1.1.2"
 minijinja = "2.3.1"
+aws-config = "1.5.8"
+aws-sdk-bedrockruntime = "1.53.0"
+aws-smithy-runtime-api = "1.7.2"
+aws-smithy-types = "1.2.7"
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

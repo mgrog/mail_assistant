@@ -7,7 +7,7 @@ use crate::{
     ServerState,
 };
 
-use super::{DailySummaryMailer, EmailProcessor};
+use super::{daily_summary_mailer::DailySummaryMailer, processor::EmailProcessor};
 
 pub async fn process_emails(state: ServerState) -> AppResult<()> {
     let conn = &state.conn;
