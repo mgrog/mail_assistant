@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chrono::{Duration, Utc};
 use entity::{prelude::*, processed_email, user_session};
 use google_gmail1::api::Message;
 use minijinja::render;
@@ -7,39 +8,92 @@ use std::collections::{HashMap, VecDeque};
 
 use sea_orm::DatabaseConnection;
 
-use crate::{email::email_template::DAILY_SUMMARY_EMAIL_TEMPLATE, structs::error::AppResult};
+use crate::{
+    email::{client::EmailClient, email_template::DAILY_SUMMARY_EMAIL_TEMPLATE},
+    structs::error::AppResult,
+    HttpClient,
+};
 
 pub struct DailySummaryMailer {
     conn: DatabaseConnection,
+    http_client: HttpClient,
     users_to_send: VecDeque<user_session::Model>,
 }
 
 impl DailySummaryMailer {
-    pub async fn new(conn: DatabaseConnection) -> AppResult<Self> {
-        let user_sessions = UserSession::find().all(&conn).await?;
-
+    pub async fn new(
+        conn: DatabaseConnection,
+        http_client: HttpClient,
+        active_user_sessions: Vec<user_session::Model>,
+    ) -> AppResult<Self> {
         Ok(Self {
             conn,
-            users_to_send: user_sessions.into_iter().collect(),
+            http_client,
+            users_to_send: active_user_sessions.into_iter().collect(),
         })
     }
 
-    // fn send(&mut self, user_session: &user_session::Model, summary: &DailySummary) {
-    //     // ...
-    // }
+    async fn send(
+        &mut self,
+        user_session: &user_session::Model,
+        processed_emails: Vec<processed_email::Model>,
+    ) -> anyhow::Result<()> {
+        tracing::info!("Sending daily email for user {}", user_session.email);
+        let raw_email = self.construct_daily_summary(&user_session.email, processed_emails)?;
+
+        let email_client = EmailClient::new(
+            self.http_client.clone(),
+            self.conn.clone(),
+            user_session.clone(),
+        )
+        .await?;
+
+        let daily_summary_label_id = email_client.get_daily_summary_label_id().await?;
+
+        let message = Message {
+            id: None,
+            thread_id: None,
+            label_ids: Some(vec!["INBOX".to_string(), daily_summary_label_id]),
+            snippet: None,
+            history_id: None,
+            internal_date: None,
+            payload: None,
+            size_estimate: None,
+            raw: Some(raw_email),
+        };
+
+        email_client.insert_message(message).await?;
+
+        Ok(())
+    }
 
     pub async fn send_to_all_users(&mut self) {
+        let twenty_four_hours_ago = Utc::now() - Duration::hours(24);
+
         while let Some(user_session) = self.users_to_send.pop_front() {
             match ProcessedEmail::find()
                 .filter(processed_email::Column::UserSessionId.eq(user_session.id))
+                .filter(processed_email::Column::ProcessedAt.gt(twenty_four_hours_ago))
                 .all(&self.conn)
                 .await
             {
                 Ok(processed_emails) if !processed_emails.is_empty() => {
-                    tracing::info!("Sending daily email for user {}", user_session.email);
-                    let summary = self
-                        .construct_daily_summary(&user_session.email, processed_emails)
-                        .expect("Could not construct daily summary");
+                    match self.send(&user_session, processed_emails).await {
+                        Ok(_) => {
+                            tracing::info!(
+                                "Daily email sent for user {}, {} users remaining",
+                                user_session.email,
+                                self.users_to_send.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Could not send daily email for user {}: {:?}",
+                                user_session.email,
+                                e
+                            );
+                        }
+                    }
                     tracing::info!(
                         "Daily email sent, {} users remaining",
                         self.users_to_send.len()
@@ -55,7 +109,6 @@ impl DailySummaryMailer {
                         user_session.email,
                         e
                     );
-                    self.users_to_send.push_back(user_session);
                 }
             }
 
@@ -67,12 +120,13 @@ impl DailySummaryMailer {
         &self,
         user_email: &str,
         processed_emails: Vec<processed_email::Model>,
-    ) -> anyhow::Result<Message> {
+    ) -> anyhow::Result<Vec<u8>> {
         let email = lettre::Message::builder()
             .to(format!("<{user_email}>")
                 .parse()
                 .context("Could not parse to in daily summary message builder")?)
             .from("Mailclerk <noreply@mailclerk.io>".parse()?)
+            .subject("Breakdown of your emails from the last 24 hours")
             .body({
                 let mut category_counts = HashMap::new();
                 for email in processed_emails {
@@ -94,19 +148,7 @@ impl DailySummaryMailer {
                 r
             })?;
 
-        let msg = Message {
-            id: None,
-            thread_id: None,
-            label_ids: Some(vec![]),
-            snippet: None,
-            history_id: None,
-            internal_date: None,
-            payload: None,
-            size_estimate: None,
-            raw: Some(email.formatted()),
-        };
-
-        Ok(msg)
+        Ok(email.formatted())
     }
 }
 
@@ -123,3 +165,38 @@ fn capitalize(s: &str) -> String {
 // struct DailySummary {
 
 // }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, str::FromStr};
+
+    use chrono::DateTime;
+    use sea_orm::{ConnectOptions, Database, DbBackend};
+
+    use super::*;
+
+    async fn setup_conn() -> DatabaseConnection {
+        dotenvy::dotenv().ok();
+        let db_url = env::var("DATABASE_URL").expect("DATABASE_URL is not set in .env file");
+        let mut db_options = ConnectOptions::new(db_url);
+        db_options.sqlx_logging(false);
+
+        Database::connect(db_options)
+            .await
+            .expect("Database connection failed")
+    }
+
+    #[tokio::test]
+    async fn test_query() {
+        // let conn = setup_conn().await;
+        let dt: DateTime<Utc> = DateTime::from_str("2024-10-07 20:04:19 +00:00").unwrap();
+
+        let query = ProcessedEmail::find()
+            .filter(processed_email::Column::UserSessionId.eq(1))
+            .filter(processed_email::Column::ProcessedAt.gt(dt))
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert_eq!(query, "SELECT \"processed_email\".\"id\", \"processed_email\".\"user_session_id\", \"processed_email\".\"user_session_email\", \"processed_email\".\"processed_at\", \"processed_email\".\"labels_applied\", \"processed_email\".\"labels_removed\", \"processed_email\".\"ai_answer\" FROM \"processed_email\" WHERE \"processed_email\".\"user_session_id\" = 1 AND \"processed_email\".\"processed_at\" > '2024-10-07 20:04:19 +00:00'");
+    }
+}

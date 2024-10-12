@@ -3,6 +3,7 @@ mod macros;
 
 mod api_quota;
 mod email;
+mod prompt;
 mod rate_limiters;
 mod request_tracing;
 mod routes;
@@ -23,7 +24,7 @@ use leaky_bucket::RateLimiter;
 use mimalloc::MiMalloc;
 use rate_limiters::RateLimiters;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
-use server_config::CONFIG;
+use server_config::cfg;
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -105,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                 move |uuid, mut l: JobScheduler| {
                     let state = state_clone.clone();
                     Box::pin(async move {
-                        match email::process_emails(state).await {
+                        match email::tasks::process_emails(state).await {
                             Ok(_) => {
                                 tracing::info!("Email processor job {} succeeded", uuid);
                             }
@@ -129,11 +130,14 @@ async fn main() -> anyhow::Result<()> {
         let state_clone = state.clone();
         scheduler
             .add(Job::new_one_shot_async(
-                Duration::from_secs(0),
+                Duration::from_secs(120),
                 move |uuid, mut _l: JobScheduler| {
                     let conn = state_clone.conn.clone();
+                    let http_client = state_clone.http_client.clone();
                     Box::pin(async move {
-                        match email::send_daily_email_summaries(conn.clone()).await {
+                        match email::tasks::send_daily_email_summaries(conn.clone(), http_client)
+                            .await
+                        {
                             Ok(_) => {
                                 tracing::info!("Daily summary mailer job {} succeeded", uuid);
                             }
@@ -178,7 +182,7 @@ fn run_server(router: Router) -> JoinHandle<()> {
         let port = env::var("PORT").unwrap_or("5006".to_string());
         tracing::info!("Auto email running on http://0.0.0.0:{}", port);
         // check config
-        tracing::info!("Config: {}", *server_config::CONFIG);
+        tracing::info!("Config: {}", *server_config::cfg);
 
         // run it with hyper
         let addr = SocketAddr::from(([0, 0, 0, 0], port.parse::<u16>().unwrap()));

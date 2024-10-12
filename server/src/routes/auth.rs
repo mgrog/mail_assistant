@@ -99,7 +99,7 @@ pub async fn handler_auth_gmail_callback(
     })?;
 
     let email_client =
-        EmailClient::new(state.http_client.clone(), resp.access_token.clone()).await?;
+        EmailClient::from_access_code(state.http_client.clone(), resp.access_token.clone());
     let profile = email_client.get_profile().await?;
     // -- DEBUG
     // println!("Profile: {:?}", profile);
@@ -118,6 +118,7 @@ pub async fn handler_auth_gmail_callback(
         )),
         created_at: ActiveValue::NotSet,
         updated_at: ActiveValue::NotSet,
+        active: ActiveValue::NotSet,
     };
     user_session::Entity::insert(session)
         .on_conflict(

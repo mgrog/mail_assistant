@@ -28,47 +28,69 @@ impl GmailConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Category {
-    pub ai: String,
+    pub content: String,
     pub mail_label: String,
     pub gmail_categories: Vec<String>,
+    pub important: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
-    pub region: String,
     pub temperature: f64,
+    pub email_confidence_threshold: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptLimits {
+    pub rate_limit_per_sec: usize,
+    pub refill_interval_ms: usize,
+    pub refill_amount: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenLimits {
+    pub rate_limit_per_min: usize,
+    pub refill_interval_ms: usize,
+    pub refill_amount: usize,
+    pub estimated_token_usage_per_email: usize,
+    pub daily_user_quota: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Settings {
+    pub training_mode: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    pub key: String,
+    pub prompt_limits: PromptLimits,
+    pub token_limits: TokenLimits,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
-    ai_api_key: String,
+    settings: Settings,
+    api: ApiConfig,
     categories: Vec<Category>,
-    prompt_rate_limit_per_min: u64,
-    token_rate_limit_per_min: u64,
-    daily_user_quota: u64,
-    estimated_token_usage_per_email: u64,
+    heuristics: Vec<Category>,
     model: ModelConfig,
 }
 
+#[derive(Debug)]
 pub struct ServerConfig {
-    pub ai_api_key: String,
+    pub settings: Settings,
+    pub api: ApiConfig,
     pub categories: Vec<Category>,
+    pub heuristics: Vec<Category>,
     pub gmail_config: GmailConfig,
-    pub prompt_rate_limit_per_min: u64,
-    pub token_rate_limit_per_min: u64,
-    pub daily_user_quota: u64,
-    pub estimated_token_usage_per_email: u64,
     pub model: ModelConfig,
 }
 
 impl std::fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ai_api_key: {}, categories: {:?}, gmail_config: {:?}",
-            self.ai_api_key, self.categories, self.gmail_config
-        )
+        write!(f, "Server Config: {:?}", self)
     }
 }
 
@@ -86,34 +108,32 @@ lazy_static! {
             .expect("config.toml is invalid");
 
         let ConfigFile {
-            ai_api_key,
+            settings,
+            api,
             categories,
-            prompt_rate_limit_per_min,
-            token_rate_limit_per_min,
-            daily_user_quota,
-            estimated_token_usage_per_email,
             model,
+            heuristics,
         } = cfg_file;
 
         ServerConfig {
-            ai_api_key,
+            settings,
+            api,
             categories,
+            heuristics,
             gmail_config,
-            prompt_rate_limit_per_min,
-            token_rate_limit_per_min,
-            daily_user_quota,
-            estimated_token_usage_per_email,
             model,
         }
     };
     pub static ref UNKNOWN_CATEGORY: Category = Category {
-        ai: "Unknown".to_string(),
+        content: "Unknown".to_string(),
         mail_label: "mailclerk:uncategorized".to_string(),
         gmail_categories: vec![],
+        important: None,
     };
     pub static ref DAILY_SUMMARY_CATEGORY: Category = Category {
-        ai: "".to_string(),
+        content: "".to_string(),
         mail_label: "mailclerk:daily_summary".to_string(),
         gmail_categories: vec![],
+        important: None,
     };
 }
