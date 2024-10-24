@@ -39,6 +39,12 @@ aws-smithy-runtime-api = "1.7.2"
 aws-smithy-types = "1.2.7"
 base64 = "0.22.1"
 html2text = "0.12.6"
+google-cloud-pubsub = "0.29.1"
+indexmap = "2.6.0"
+tokio-util = "0.7.12"
+google-cloud-googleapis = "0.15.0"
+chrono-tz = "0.10.0"
+derive_more = { version = "1.0.0", features = ["display"] }
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

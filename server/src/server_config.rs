@@ -27,6 +27,7 @@ impl GmailConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Category {
     pub content: String,
     pub mail_label: String,
@@ -35,6 +36,7 @@ pub struct Category {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ModelConfig {
     pub id: String,
     pub temperature: f64,
@@ -49,6 +51,7 @@ pub struct PromptLimits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TokenLimits {
     pub rate_limit_per_min: usize,
     pub refill_interval_ms: usize,
@@ -58,11 +61,13 @@ pub struct TokenLimits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Settings {
     pub training_mode: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ApiConfig {
     pub key: String,
     pub prompt_limits: PromptLimits,
@@ -90,7 +95,22 @@ pub struct ServerConfig {
 
 impl std::fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Server Config: {:?}", self)
+        write!(
+            f,
+            "Server Config:\n{:?}\n\nAPI: {:?}\n\nCategories:\n{}\n\nHeuristics:\n{}\n\nGmail Config: {:?}\n\nModel Config: {:?}\n\n",
+            self.settings,
+            self.api,
+            self.categories
+                .iter()
+                .map(|c| format!("{} -> {}", c.content, c.mail_label))
+                .collect::<Vec<_>>().join("\n"),
+                self.heuristics
+                .iter()
+                .map(|c| format!("{} -> {}", c.content, c.mail_label))
+                .collect::<Vec<_>>().join("\n"),
+            self.gmail_config,
+            self.model
+        )
     }
 }
 

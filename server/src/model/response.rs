@@ -22,3 +22,22 @@ pub struct LabelUpdate {
     pub added: Vec<String>,
     pub removed: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailWatchInboxPushNotification {
+    pub email_address: String,
+    pub history_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GmailError {
+    pub code: u32,
+    pub message: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GmailErrorResponse {
+    pub error: GmailError,
+}

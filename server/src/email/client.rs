@@ -4,25 +4,27 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
-use entity::user_session;
+use entity::{inbox_settings, user_session};
 use futures::future::join_all;
 use google_gmail1::api::{
-    Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile,
+    Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
 };
+use indexmap::IndexSet;
 use leaky_bucket::RateLimiter;
 use mail_parser::MessageParser;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use sea_orm::{entity::*, prelude::*};
 use sea_orm::{ActiveValue, DatabaseConnection, EntityTrait};
 use serde_json::json;
 
 use crate::{
     api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND},
+    model::{inbox_setting::PartialInboxSetting, response::LabelUpdate},
     routes::auth,
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
-    structs::response::LabelUpdate,
 };
 
 macro_rules! gmail_url {
@@ -48,6 +50,7 @@ pub struct EmailClient {
     http_client: reqwest::Client,
     access_token: String,
     rate_limiter: RateLimiter,
+    pub user_inbox_settings: HashMap<String, PartialInboxSetting>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +66,23 @@ pub struct EmailMessage {
     pub snippet: String,
     pub body: Option<String>,
 }
+
+enum EmailClientError {
+    RateLimitExceeded,
+    Unauthorized,
+    BadRequest,
+    Unknown,
+}
+
+type EmailClientResult<T> = Result<T, EmailClientError>;
+
+// fn parse_gmail_response<T>(resp: reqwest::Response) -> EmailClientResult<T>
+// where
+//     T: serde::de::DeserializeOwned,
+// {
+//     let data = resp.json::<T>().await
+//     Ok(data)
+// }
 
 impl EmailClient {
     pub async fn new(
@@ -97,10 +117,21 @@ impl EmailClient {
             user_session.access_token
         };
 
+        // This will be a map from mailclerk:* -> inbox_settings
+        let user_inbox_settings = inbox_settings::Entity::find()
+            .filter(inbox_settings::Column::UserSessionId.eq(user_session.id))
+            .into_partial_model::<PartialInboxSetting>()
+            .all(&conn)
+            .await?
+            .into_iter()
+            .map(|setting| (format!("mailclerk:{}", setting.category), setting))
+            .collect::<HashMap<_, _>>();
+
         Ok(EmailClient {
             http_client,
             access_token,
             rate_limiter,
+            user_inbox_settings,
         })
     }
 
@@ -115,28 +146,38 @@ impl EmailClient {
             http_client,
             access_token,
             rate_limiter,
+            user_inbox_settings: HashMap::new(),
         }
     }
 
-    pub async fn watch_mailbox(&self) -> anyhow::Result<()> {
-        self.rate_limiter
-            .acquire(GMAIL_API_QUOTA.watch)
-            .await;
+    pub async fn watch_mailbox(&self) -> anyhow::Result<WatchResponse> {
+        self.rate_limiter.acquire(GMAIL_API_QUOTA.watch).await;
+        const TOPIC_NAME: &str = "projects/mail-assist-434915/topics/mailclerk-user-inboxes";
         let resp = self
             .http_client
             .post(gmail_url!("watch"))
             .bearer_auth(&self.access_token)
             .json(&json!({
-                "topicName": "projects/mailclerk/topics/mailclerk-user-inboxes",
+                "topicName": TOPIC_NAME,
                 "labelIds": ["INBOX"],
+                "labelFilterBehavior": "INCLUDE",
             }));
 
-            Ok(())
+        let data = resp.send().await?;
+
+        if !data.status().is_success() {
+            let json = data.json::<serde_json::Value>().await?;
+            return Err(anyhow!("Error watching mailbox: {:?}", json));
+        }
+
+        let json = data.json::<WatchResponse>().await?;
+
+        Ok(json)
     }
 
     pub async fn get_message_list(
         &self,
-         options: MessageListOptions,
+        options: MessageListOptions,
     ) -> anyhow::Result<ListMessagesResponse> {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_list)
@@ -174,7 +215,10 @@ impl EmailClient {
         // -- DEBUG
 
         let mut query = vec![
-            ("q".to_string(), format!("{} {}", labels_filter, time_filter)),
+            (
+                "q".to_string(),
+                format!("{} {}", labels_filter, time_filter),
+            ),
             ("maxResults".to_string(), "300".to_string()),
         ];
 
@@ -237,6 +281,7 @@ impl EmailClient {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.labels_create)
             .await;
+
         let resp = self
             .http_client
             .post(gmail_url!("labels"))
@@ -325,8 +370,24 @@ impl EmailClient {
             return Ok(false);
         }
 
-        // Add missing mailclerk labels
-        let add_label_tasks = missing_labels.into_iter().map(|label| {
+        static COLORS: Lazy<Vec<LabelColor>> = Lazy::new(|| {
+            LABEL_COLORS
+                .iter()
+                .map(|(_, bg, text)| LabelColor {
+                    background_color: Some(bg.to_string()),
+                    text_color: Some(text.to_string()),
+                })
+                .collect::<Vec<_>>()
+        });
+        let labels_to_add = cfg
+            .categories
+            .iter()
+            .chain(cfg.heuristics.iter())
+            .map(|c| c.mail_label.to_string())
+            .collect::<IndexSet<_>>();
+
+        // Readd mailclerk labels
+        let add_label_tasks = labels_to_add.into_iter().enumerate().map(|(idx, label)| {
             let (message_list_visibility, label_list_visibility) =
                 if label == UNKNOWN_CATEGORY.mail_label {
                     (Some("hide".to_string()), Some("labelHide".to_string()))
@@ -339,7 +400,7 @@ impl EmailClient {
             let label = Label {
                 id: None,
                 type_: Some("user".to_string()),
-                color: Some(get_label_color(&label)),
+                color: COLORS.get(idx % COLORS.len()).cloned(),
                 name: Some(label.clone()),
                 messages_total: None,
                 messages_unread: None,
@@ -351,21 +412,34 @@ impl EmailClient {
             async { self.create_label(label).await }
         });
 
-        // Remove old mailclerk labels that are no longer used
+        // Reset mailclerk labels
         //? Maybe remove this in the future?
-        let remove_label_tasks = unneeded_labels.into_iter().map(|label| async {
+        //? Probably needs to migrate existing mails to new labels
+        let remove_label_tasks = existing_labels.into_iter().map(|label| async {
             let id = label.id.context("Label id not provided")?;
             self.delete_label(id).await
         });
 
-        let results = join_all(add_label_tasks).await;
-        for result in results {
-            result?;
-        }
-
         let results = join_all(remove_label_tasks).await;
         for result in results {
-            result?;
+            match result {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return Err(e);
+                }
+            }
+        }
+
+        let results = join_all(add_label_tasks).await;
+        for result in results {
+            match result {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return Err(e);
+                }
+            }
         }
 
         Ok(true)
@@ -386,7 +460,10 @@ impl EmailClient {
                 .create_label(Label {
                     id: None,
                     type_: Some("user".to_string()),
-                    color: Some(get_label_color(&daily_summary_label_name)),
+                    color: Some(LabelColor {
+                        background_color: Some("#ffffff".to_string()),
+                        text_color: Some("#000000".to_string()),
+                    }),
                     name: Some(daily_summary_label_name.clone()),
                     messages_total: None,
                     messages_unread: None,
@@ -411,7 +488,9 @@ impl EmailClient {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_modify)
             .await;
-        let (json_body, update) = build_label_update(user_labels, current_labels, category)?;
+        let inbox_settings = &self.user_inbox_settings;
+        let (json_body, update) =
+            build_label_update(user_labels, current_labels, category, inbox_settings)?;
         let resp = self
             .http_client
             .post(gmail_url!("messages", &email_id, "modify"))
@@ -522,6 +601,7 @@ fn build_label_update(
     user_labels: Vec<Label>,
     current_labels: Vec<String>,
     category: Category,
+    inbox_settings: &HashMap<String, PartialInboxSetting>,
 ) -> anyhow::Result<(serde_json::Value, LabelUpdate)> {
     static RE_CATEGORY_LABEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"CATEGORY_+").unwrap());
 
@@ -533,11 +613,21 @@ fn build_label_update(
 
     let categories_to_add = category.gmail_categories;
 
-    let categories_to_remove = current_categories
+    let mut categories_to_remove = current_categories
         .iter()
         .filter(|c| !categories_to_add.contains(c))
         .cloned()
         .collect::<Vec<_>>();
+
+    if let Some(setting) = inbox_settings.get(&category.mail_label) {
+        if setting.skip_inbox {
+            categories_to_remove.push("INBOX".to_string());
+        }
+        // TODO: Implement spam marking
+        // if setting.mark_spam {
+        //
+        // }
+    }
 
     let label_id = user_labels
         .iter()
@@ -576,24 +666,126 @@ fn build_label_update(
     ))
 }
 
-const LABEL_COLORS: [(&str, &str); 2] = [
-    ("White", "#ffffff"),
-    ("Dark Gray", "#434343"),
-    // add more colors as needed...
+const LABEL_COLORS: [(&str, &str, &str); 103] = [
+    ("Silver", "#e7e7e7", "#000000"),
+    ("Crimson", "#8a1c0a", "#ffffff"),
+    ("Orange", "#ff7537", "#ffffff"),
+    ("Gold", "#ffad47", "#000000"),
+    ("Green", "#1a764d", "#ffffff"),
+    ("Teal", "#2da2bb", "#ffffff"),
+    ("Blue", "#1c4587", "#ffffff"),
+    ("Purple", "#41236d", "#ffffff"),
+    ("Salmon", "#efa093", "#000000"),
+    ("Red Orange", "#fb4c2f", "#ffffff"),
+    ("Light Yellow", "#fad165", "#000000"),
+    ("Green", "#16a766", "#ffffff"),
+    ("Light Green", "#43d692", "#000000"),
+    ("Blue", "#4a86e8", "#ffffff"),
+    ("Purple", "#a479e2", "#ffffff"),
+    ("Pink", "#f691b3", "#000000"),
+    ("Light Pink", "#f6c5be", "#000000"),
+    ("Pale Peach", "#ffe6c7", "#000000"),
+    ("Light Cream", "#fef1d1", "#000000"),
+    ("Pale Green", "#b9e4d0", "#000000"),
+    ("Very Light Green", "#c6f3de", "#000000"),
+    ("Pale Blue", "#c9daf8", "#000000"),
+    ("Lavender", "#e4d7f5", "#000000"),
+    ("Light Pink", "#fcdee8", "#000000"),
+    ("Light Orange", "#ffd6a2", "#000000"),
+    ("Pale Yellow", "#fce8b3", "#000000"),
+    ("Mint Green", "#89d3b2", "#000000"),
+    ("Light Mint", "#a0eac9", "#000000"),
+    ("Light Blue", "#a4c2f4", "#000000"),
+    ("Light Lavender", "#d0bcf1", "#000000"),
+    ("Light Pink", "#fbc8d9", "#000000"),
+    ("Coral", "#e66550", "#ffffff"),
+    ("Light Orange", "#ffbc6b", "#000000"),
+    ("Pale Yellow", "#fcda83", "#000000"),
+    ("Green", "#44b984", "#ffffff"),
+    ("Light Green", "#68dfa9", "#000000"),
+    ("Blue", "#6d9eeb", "#ffffff"),
+    ("Lavender", "#b694e8", "#ffffff"),
+    ("Pink", "#f7a7c0", "#000000"),
+    ("Dark Red", "#cc3a21", "#ffffff"),
+    ("Orange", "#eaa041", "#000000"),
+    ("Yellow", "#f2c960", "#000000"),
+    ("Dark Green", "#149e60", "#ffffff"),
+    ("Light Green", "#3dc789", "#000000"),
+    ("Blue", "#3c78d8", "#ffffff"),
+    ("Purple", "#8e63ce", "#ffffff"),
+    ("Pink", "#e07798", "#000000"),
+    ("Dark Red", "#ac2b16", "#ffffff"),
+    ("Orange", "#cf8933", "#000000"),
+    ("Yellow", "#d5ae49", "#000000"),
+    ("Dark Green", "#0b804b", "#ffffff"),
+    ("Green", "#2a9c68", "#ffffff"),
+    ("Blue", "#285bac", "#ffffff"),
+    ("Purple", "#653e9b", "#ffffff"),
+    ("Pink", "#b65775", "#000000"),
+    ("Dark Red", "#822111", "#ffffff"),
+    ("Orange", "#a46a21", "#000000"),
+    ("Yellow", "#aa8831", "#000000"),
+    ("Dark Green", "#076239", "#ffffff"),
+    ("Pink", "#83334c", "#ffffff"),
+    ("Dark Gray", "#464646", "#ffffff"),
+    ("Light Gray", "#e7e7e7", "#000000"),
+    ("Dark Blue", "#0d3472", "#ffffff"),
+    ("Light Blue", "#b6cff5", "#000000"),
+    ("Dark Teal", "#0d3b44", "#ffffff"),
+    ("Light Teal", "#98d7e4", "#000000"),
+    ("Dark Purple", "#3d188e", "#ffffff"),
+    ("Light Lavender", "#e3d7ff", "#000000"),
+    ("Dark Pink", "#711a36", "#ffffff"),
+    ("Light Pink", "#fbd3e0", "#000000"),
+    ("Light Red", "#f2b2a8", "#000000"),
+    ("Dark Brown", "#7a2e0b", "#ffffff"),
+    ("Light Brown", "#ffc8af", "#000000"),
+    ("Dark Orange", "#7a4706", "#ffffff"),
+    ("Light Orange", "#ffdeb5", "#000000"),
+    ("Dark Yellow", "#594c05", "#ffffff"),
+    ("Light Yellow", "#fbe983", "#000000"),
+    ("Dark Brown", "#684e07", "#ffffff"),
+    ("Light Brown", "#fdedc1", "#000000"),
+    ("Dark Green", "#0b4f30", "#ffffff"),
+    ("Light Green", "#b3efd3", "#000000"),
+    ("Dark Green", "#04502e", "#ffffff"),
+    ("Light Green", "#a2dcc1", "#000000"),
+    ("Gray", "#c2c2c2", "#000000"),
+    ("Blue", "#4986e7", "#ffffff"),
+    ("Lavender", "#b99aff", "#000000"),
+    ("Dark Pink", "#994a64", "#ffffff"),
+    ("Pink", "#f691b2", "#000000"),
+    ("Golden Yellow", "#ffad46", "#000000"),
+    ("Dark Red", "#662e37", "#ffffff"),
+    ("Light Gray", "#ebdbde", "#000000"),
+    ("Light Pink", "#cca6ac", "#000000"),
+    ("Dark Green", "#094228", "#ffffff"),
+    ("Light Green", "#42d692", "#000000"),
+    ("Green", "#16a765", "#ffffff"),
+    ("White", "#ffffff", "#000000"),
+    ("Black", "#000000", "#ffffff"),
+    ("Dark Gray", "#434343", "#ffffff"),
+    ("Gray", "#666666", "#ffffff"),
+    ("Light Gray", "#999999", "#000000"),
+    ("Very Light Gray", "#cccccc", "#000000"),
+    ("Pale Gray", "#efefef", "#000000"),
+    ("Almost White", "#f3f3f3", "#000000"),
 ];
 
-fn get_label_color(_label: &str) -> LabelColor {
-    let color_map = Lazy::new(|| LABEL_COLORS.iter().cloned().collect::<HashMap<_, _>>());
-    let bg = color_map.get("Dark Gray").map(|c| c.to_string());
-    let text = color_map.get("White").map(|c| c.to_string());
-    LabelColor {
-        background_color: bg,
-        text_color: text,
-    }
-}
+// fn get_label_color(_label: &str) -> LabelColor {
+//     let color_map = Lazy::new(|| LABEL_COLORS.iter().cloned().collect::<HashMap<_, _>>());
+//     let bg = color_map.get("Dark Gray").map(|c| c.to_string());
+//     let text = color_map.get("White").map(|c| c.to_string());
+//     LabelColor {
+//         background_color: bg,
+//         text_color: text,
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use google_gmail1::api::Label;
 
     #[test]
@@ -623,6 +815,7 @@ mod tests {
                 gmail_categories: vec!["CATEGORY_PROMOTIONS".to_string()],
                 important: None,
             },
+            &HashMap::new(),
         ) {
             Ok((json_body, update)) => {
                 assert_eq!(
@@ -694,7 +887,7 @@ mod tests {
             "Also Consider -- Based on your resumeSenior Software Engineer-(PHP, TypeScript, Node, AWS) [[LINK]] Senior Software Engineer-CONTRACT-REMOTE [] REMOTE [] Charlotte, NC [] $70 - $90 1-Click Apply [[LINK]] [Chris Chomic] Chris ",
             "Also Consider -- Based on your resume Senior React Native Developer [[LINK]] [] REMOTE [] San Francisco, CA [] $160,000 - $180,000 1-Click Apply [[LINK]] [Joe Lynch] Joe ",
             "Also Consider -- Based on yourresume Senior Backend Engineer [[LINK]] Build out modern platforms supporting the short term rental SaaS space 100% Remote [] REMOTE [] Philadelphia, PA +1 [] $130,000 - $175,000 1-Click Apply [[LINK]] [Charles Simmons] Charles [LinkedIn logo] [[LINK]][Instagram logo] [[LINK]] Jobot.com [[LINK]] | Unsubscribe [[LINK]] Copyright Jobot, LLC, All rights reserved. 3101 West Pacific Coast Hwy,Newport Beach, CA 92663"
-        ).to_string()) 
+        ).to_string())
         };
         assert_eq!(sanitized, test);
     }

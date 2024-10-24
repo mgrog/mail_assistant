@@ -9,8 +9,8 @@ use serde_json::json;
 
 use crate::{
     email::client::EmailMessage,
+    model::error::{AppError, AppResult},
     server_config::cfg,
-    structs::error::{AppError, AppResult},
     ServerState,
 };
 
@@ -80,8 +80,18 @@ pub async fn send_category_prompt(
             }
         })?;
 
-    let parsed = serde_json::from_value::<ChatApiResponse>(resp.clone())
+    let parsed = serde_json::from_value::<ChatApiResponseOrError>(resp.clone())
         .context(format!("Could not parse chat response: {}", resp))?;
+
+    let parsed = match parsed {
+        ChatApiResponseOrError::Error(error) => {
+            if error.message == "Requests rate limit exceeded" {
+                server_state.rate_limiters.trigger_backoff();
+            }
+            return Err(anyhow!("Chat API error: {:?}", error).into());
+        }
+        ChatApiResponseOrError::Response(parsed) => parsed,
+    };
 
     let (category, confidence, usage) = {
         let choice = parsed.choices.first().context("No choices in response")?;
@@ -135,13 +145,13 @@ pub async fn send_category_prompt(
         }
     }?;
 
-    // -- Debug
-    println!("Email from: {:?}", email_message.from);
-    println!("Email subject: {}", subject);
+    // -- DEBUG
+    // println!("Email from: {:?}", email_message.from);
+    // println!("Email subject: {}", subject);
     // println!("Email snippet: {}", email_message.snippet);
-    println!("Email body: {}", body.chars().take(400).collect::<String>());
-    println!("Answer: {}, Confidence: {}", category, confidence);
-    // -- Debug
+    // println!("Email body: {}", body.chars().take(400).collect::<String>());
+    // println!("Answer: {}, Confidence: {}", category, confidence);
+    // -- DEBUG
 
     Ok(CategoryPromptResponse {
         category,
@@ -197,4 +207,16 @@ pub struct ChatChoice {
 pub struct ChatApiResponse {
     pub choices: Vec<ChatChoice>,
     pub usage: PromptUsage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatApiError {
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatApiResponseOrError {
+    Response(ChatApiResponse),
+    Error(ChatApiError),
 }

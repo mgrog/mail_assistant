@@ -8,7 +8,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub user_session_id: i32,
-    pub user_session_email: String,
     pub processed_at: DateTimeWithTimeZone,
     pub labels_applied: Vec<String>,
     pub labels_removed: Vec<String>,
@@ -19,20 +18,18 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(
         belongs_to = "super::user_session::Entity",
-        from = "Column::UserSessionEmail",
-        to = "super::user_session::Column::Email",
-        on_update = "NoAction",
-        on_delete = "Cascade"
-    )]
-    UserSession2,
-    #[sea_orm(
-        belongs_to = "super::user_session::Entity",
         from = "Column::UserSessionId",
         to = "super::user_session::Column::Id",
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    UserSession1,
+    UserSession,
+}
+
+impl Related<super::user_session::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::UserSession.def()
+    }
 }
 
 impl ActiveModelBehavior for ActiveModel {}

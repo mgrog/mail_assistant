@@ -1,24 +1,24 @@
 extern crate google_gmail1 as gmail;
 
-use anyhow::Context;
+use crate::db_core::prelude::*;
+use anyhow::{anyhow, Context};
 use axum::{
     extract::{Query, State},
     Json,
 };
 use chrono::DateTime;
-use entity::user_session;
-use sea_orm::{sea_query::OnConflict, ActiveValue, EntityTrait};
+use entity::user_session::Column::*;
 use serde::Deserialize;
 use serde_json::json;
-use user_session::Column::*;
 
 use crate::{
     email::client::EmailClient,
-    server_config::{cfg, GmailConfig},
-    structs::{
+    model::{
         error::{AppError, AppJsonResult, AppResult},
         response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
     },
+    server_config::{cfg, GmailConfig},
+    settings::prelude::*,
     HttpClient, ServerState,
 };
 
@@ -119,15 +119,28 @@ pub async fn handler_auth_gmail_callback(
         created_at: ActiveValue::NotSet,
         updated_at: ActiveValue::NotSet,
         active: ActiveValue::NotSet,
+        last_sync: ActiveValue::NotSet,
     };
-    user_session::Entity::insert(session)
+    let user_session = UserSession::insert(session)
         .on_conflict(
             OnConflict::column(Email)
                 .update_columns([AccessToken, RefreshToken, ExpiresAt, UpdatedAt])
                 .to_owned(),
         )
-        .exec(&state.conn)
+        .exec_with_returning(&state.conn)
         .await?;
+
+    match configure_default_user_settings(&state, user_session.id).await {
+        Ok(_) => {}
+        Err(AppError::Conflict(_)) => {
+            tracing::info!("User settings already exists");
+        }
+        Err(e) => {
+            return Err(e);
+        }
+    }
+
+    configure_default_inbox_settings(&state, user_session.id).await?;
 
     Ok(Json(json!({
         "message": "Login success",

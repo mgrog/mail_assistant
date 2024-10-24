@@ -15,19 +15,44 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub active: bool,
+    pub last_sync: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(has_many = "super::inbox_settings::Entity")]
+    InboxSettings,
     #[sea_orm(has_many = "super::processed_daily_summary::Entity")]
     ProcessedDailySummary,
+    #[sea_orm(has_many = "super::processed_email::Entity")]
+    ProcessedEmail,
+    #[sea_orm(has_one = "super::user_settings::Entity")]
+    UserSettings,
     #[sea_orm(has_many = "super::user_token_usage_stats::Entity")]
     UserTokenUsageStats,
+}
+
+impl Related<super::inbox_settings::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::InboxSettings.def()
+    }
 }
 
 impl Related<super::processed_daily_summary::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ProcessedDailySummary.def()
+    }
+}
+
+impl Related<super::processed_email::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::ProcessedEmail.def()
+    }
+}
+
+impl Related<super::user_settings::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::UserSettings.def()
     }
 }
 

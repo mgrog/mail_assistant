@@ -15,7 +15,6 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(string(ProcessedEmail::Id).primary_key())
                     .col(integer(ProcessedEmail::UserSessionId).not_null())
-                    .col(string(ProcessedEmail::UserSessionEmail).not_null())
                     .col(
                         timestamp_with_time_zone(ProcessedEmail::ProcessedAt)
                             .default(Expr::current_timestamp())
@@ -29,13 +28,6 @@ impl MigrationTrait for Migration {
                             .name("fk-processed_email-user_session_id")
                             .from(ProcessedEmail::Table, ProcessedEmail::UserSessionId)
                             .to(UserSession::Table, UserSession::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk-processed_email-user_session_email")
-                            .from(ProcessedEmail::Table, ProcessedEmail::UserSessionEmail)
-                            .to(UserSession::Table, UserSession::Email)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
@@ -53,17 +45,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx-processed_email-user_session_email")
-                    .table(ProcessedEmail::Table)
-                    .col(ProcessedEmail::UserSessionEmail)
-                    .to_owned(),
-            )
-            .await?;
-
         Ok(())
     }
 
@@ -72,14 +53,6 @@ impl MigrationTrait for Migration {
             .drop_index(
                 Index::drop()
                     .name("idx-processed_email-user_session_id")
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx-processed_email-user_session_email")
                     .to_owned(),
             )
             .await?;
@@ -95,7 +68,6 @@ pub enum ProcessedEmail {
     Table,
     Id,
     UserSessionId,
-    UserSessionEmail,
     AiAnswer,
     LabelsApplied,
     LabelsRemoved,

@@ -1,5 +1,7 @@
 use sea_orm_migration::{prelude::*, schema::*};
 
+use crate::m20220101_000001_create_table::UserSession;
+
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -14,11 +16,11 @@ impl MigrationTrait for Migration {
                     .table(UserSettings::Table)
                     .if_not_exists()
                     .col(pk_auto(UserSettings::Id))
-                    .col(integer(UserSettings::UserSessionId).not_null())
+                    .col(integer(UserSettings::UserSessionId).not_null().unique_key())
                     .foreign_key(
                         ForeignKey::create()
                             .from(UserSettings::Table, UserSettings::UserSessionId)
-                            .to(UserSettings::Table, UserSettings::Id)
+                            .to(UserSession::Table, UserSession::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .col(
@@ -47,6 +49,7 @@ impl MigrationTrait for Migration {
                     .name(IDX_USER_SETTINGS_USER_SESSION_ID)
                     .table(UserSettings::Table)
                     .col(UserSettings::UserSessionId)
+                    .unique()
                     .to_owned(),
             )
             .await?;

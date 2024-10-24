@@ -8,6 +8,8 @@ mod m20241004_190600_user_settings;
 mod m20241009_192424_add_training_table;
 mod m20241011_180942_add_active_user_session_col;
 mod m20241011_195653_add_training_heuristics_col;
+mod m20241018_062532_add_inbox_settings;
+mod m20241021_013218_add_last_sync_col;
 
 pub struct Migrator;
 
@@ -23,6 +25,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20241009_192424_add_training_table::Migration),
             Box::new(m20241011_180942_add_active_user_session_col::Migration),
             Box::new(m20241011_195653_add_training_heuristics_col::Migration),
+            Box::new(m20241018_062532_add_inbox_settings::Migration),
+            Box::new(m20241021_013218_add_last_sync_col::Migration),
         ]
     }
 }

@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::atomic::Ordering::Relaxed;
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use leaky_bucket::RateLimiter;
 
@@ -8,6 +12,8 @@ use crate::server_config::cfg;
 pub struct RateLimiters {
     prompt: Arc<RateLimiter>,
     token: Arc<RateLimiter>,
+    backoff: Arc<AtomicBool>,
+    backoff_duration: Duration,
 }
 
 impl RateLimiters {
@@ -27,17 +33,40 @@ impl RateLimiters {
             ))
             .refill(cfg.api.token_limits.refill_amount)
             .build();
+
         Self {
             prompt: Arc::new(prompt),
             token: Arc::new(token),
+            backoff: Arc::new(AtomicBool::new(false)),
+            backoff_duration: Duration::from_secs(60),
         }
     }
     pub async fn acquire(&self, token_count: usize) {
+        if self.backoff.load(Relaxed) {
+            tokio::time::sleep(self.backoff_duration).await;
+        }
         self.prompt.acquire_one().await;
         self.token.acquire(token_count).await;
     }
 
     pub async fn acquire_one(&self) {
+        if self.backoff.load(Relaxed) {
+            tokio::time::sleep(self.backoff_duration).await;
+        }
         self.prompt.acquire_one().await;
+    }
+
+    pub fn trigger_backoff(&self) {
+        tracing::info!("Triggering backoff...");
+        self.backoff
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let self_ = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::info!("Backoff expired");
+            self_
+                .backoff
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }

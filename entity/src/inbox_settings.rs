@@ -3,15 +3,14 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
-#[sea_orm(table_name = "user_settings")]
+#[sea_orm(table_name = "inbox_settings")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    #[sea_orm(unique)]
     pub user_session_id: i32,
-    pub daily_summary_enabled: bool,
-    pub daily_summary_time: String,
-    pub user_time_zone_offset: String,
+    pub category: String,
+    pub skip_inbox: bool,
+    pub mark_spam: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

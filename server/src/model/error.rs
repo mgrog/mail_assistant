@@ -21,6 +21,7 @@ pub enum AppError {
     TooManyRequests,
     Unauthorized(String),
     DbError(sea_orm::error::DbErr),
+    Conflict(String),
     AiPrompt(BedrockConverseError),
 }
 
@@ -150,6 +151,13 @@ impl IntoResponse for AppError {
                     }})),
                 )
             }
+            AppError::Conflict(msg) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": StatusCode::CONFLICT.as_u16(),
+                    "message": msg
+                })),
+            ),
             AppError::AiPrompt(err) => {
                 tracing::error!("Error: {:?}", err);
                 (

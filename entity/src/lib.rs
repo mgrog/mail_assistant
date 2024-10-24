@@ -3,6 +3,7 @@
 pub mod prelude;
 
 pub mod email_training;
+pub mod inbox_settings;
 pub mod processed_daily_summary;
 pub mod processed_email;
 pub mod user_session;
