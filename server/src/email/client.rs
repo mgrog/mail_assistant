@@ -4,9 +4,10 @@ use std::{
     time::Duration,
 };
 
+use crate::db_core::prelude::*;
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
-use entity::{inbox_settings, user_session};
+use entity::user_session;
 use futures::future::join_all;
 use google_gmail1::api::{
     Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
@@ -16,15 +17,17 @@ use leaky_bucket::RateLimiter;
 use mail_parser::MessageParser;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sea_orm::{entity::*, prelude::*};
-use sea_orm::{ActiveValue, DatabaseConnection, EntityTrait};
 use serde_json::json;
 
 use crate::{
     api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND},
-    model::{inbox_setting::PartialInboxSetting, response::LabelUpdate},
+    model::response::LabelUpdate,
     routes::auth,
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
+    settings::{
+        self,
+        inbox::{default_inbox_settings, CategoryInboxSettingsMap},
+    },
 };
 
 macro_rules! gmail_url {
@@ -50,7 +53,7 @@ pub struct EmailClient {
     http_client: reqwest::Client,
     access_token: String,
     rate_limiter: RateLimiter,
-    pub user_inbox_settings: HashMap<String, PartialInboxSetting>,
+    pub category_inbox_settings: CategoryInboxSettingsMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,24 +120,27 @@ impl EmailClient {
             user_session.access_token
         };
 
+        let user_configured_settings =
+            settings::inbox::get_user_inbox_settings(&conn, user_session.id).await?;
+
+        let mut category_inbox_settings = default_inbox_settings();
+        category_inbox_settings.extend(user_configured_settings);
+
         // This will be a map from mailclerk:* -> inbox_settings
-        let user_inbox_settings = inbox_settings::Entity::find()
-            .filter(inbox_settings::Column::UserSessionId.eq(user_session.id))
-            .into_partial_model::<PartialInboxSetting>()
-            .all(&conn)
-            .await?
+        let category_inbox_settings = category_inbox_settings
             .into_iter()
-            .map(|setting| (format!("mailclerk:{}", setting.category), setting))
+            .map(|(category, setting)| (format!("mailclerk:{}", category), setting))
             .collect::<HashMap<_, _>>();
 
         Ok(EmailClient {
             http_client,
             access_token,
             rate_limiter,
-            user_inbox_settings,
+            category_inbox_settings,
         })
     }
 
+    // This is only used to test a new client on authentication
     pub fn from_access_code(http_client: reqwest::Client, access_token: String) -> EmailClient {
         let rate_limiter = RateLimiter::builder()
             .initial(GMAIL_QUOTA_PER_SECOND)
@@ -146,7 +152,7 @@ impl EmailClient {
             http_client,
             access_token,
             rate_limiter,
-            user_inbox_settings: HashMap::new(),
+            category_inbox_settings: HashMap::new(),
         }
     }
 
@@ -219,7 +225,7 @@ impl EmailClient {
                 "q".to_string(),
                 format!("{} {}", labels_filter, time_filter),
             ),
-            ("maxResults".to_string(), "300".to_string()),
+            ("maxResults".to_string(), "500".to_string()),
         ];
 
         if let Some(token) = options.page_token {
@@ -290,7 +296,11 @@ impl EmailClient {
             .send()
             .await?;
         let data = resp.json::<serde_json::Value>().await?;
-        if data.get("error").is_some() {
+        if let Some(error) = data.get("error") {
+            if error.get("code").map_or(false, |x| x.as_i64() == Some(409)) {
+                // Label already exists
+                return Ok(label);
+            }
             return Err(anyhow::anyhow!("Error creating label: {:?}", data));
         }
 
@@ -328,6 +338,10 @@ impl EmailClient {
             .cloned()
             .collect::<Vec<_>>();
 
+        // -- DEBUG
+        // println!("Existing labels: {:?}", existing_labels);
+        // -- DEBUG
+
         // Configure labels if they need it
         let mut required_labels = cfg
             .categories
@@ -351,6 +365,10 @@ impl EmailClient {
             .difference(&existing_label_names)
             .cloned()
             .collect::<Vec<_>>();
+
+        // -- DEBUG
+        // println!("Missing labels: {:?}", existing_labels);
+        // -- DEBUG
 
         let unneeded_labels = {
             let unneeded = existing_label_names
@@ -415,21 +433,21 @@ impl EmailClient {
         // Reset mailclerk labels
         //? Maybe remove this in the future?
         //? Probably needs to migrate existing mails to new labels
-        let remove_label_tasks = existing_labels.into_iter().map(|label| async {
-            let id = label.id.context("Label id not provided")?;
-            self.delete_label(id).await
-        });
+        // let remove_label_tasks = existing_labels.into_iter().map(|label| async {
+        //     let id = label.id.context("Label id not provided")?;
+        //     self.delete_label(id).await
+        // });
 
-        let results = join_all(remove_label_tasks).await;
-        for result in results {
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("{e}");
-                    return Err(e);
-                }
-            }
-        }
+        // let results = join_all(remove_label_tasks).await;
+        // for result in results {
+        //     match result {
+        //         Ok(_) => {}
+        //         Err(e) => {
+        //             tracing::error!("{e}");
+        //             return Err(e);
+        //         }
+        //     }
+        // }
 
         let results = join_all(add_label_tasks).await;
         for result in results {
@@ -437,7 +455,7 @@ impl EmailClient {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::error!("{e}");
-                    return Err(e);
+                    // return Err(e);
                 }
             }
         }
@@ -488,7 +506,7 @@ impl EmailClient {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_modify)
             .await;
-        let inbox_settings = &self.user_inbox_settings;
+        let inbox_settings = &self.category_inbox_settings;
         let (json_body, update) =
             build_label_update(user_labels, current_labels, category, inbox_settings)?;
         let resp = self
@@ -542,15 +560,16 @@ fn sanitize_message(msg: Message) -> anyhow::Result<EmailMessage> {
         Regex::new(r"https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)").unwrap()
     });
 
-    let id = msg.id.unwrap_or_default();
-    let label_ids = msg.label_ids.unwrap_or_default();
-    let thread_id = msg.thread_id.unwrap_or_default();
-    let snippet = msg.snippet.unwrap_or_default();
+    let id = msg.clone().id.unwrap_or_default();
+    let label_ids = msg.clone().label_ids.unwrap_or_default();
+    let thread_id = msg.thread_id.clone().unwrap_or_default();
+    let snippet = msg.clone().snippet.unwrap_or_default();
     let history_id = msg.history_id.unwrap_or_default();
     let internal_date = msg.internal_date.unwrap_or_default();
     msg.raw
+        .as_ref()
         .map(|input| {
-            let msg = MessageParser::default().parse(&input);
+            let msg = MessageParser::default().parse(input);
             let (subject, body, from) = msg.map_or((None, None, None), |m| {
                 let subject = m.subject().map(|s| s.to_string());
                 let body = m.body_text(0).map(|b| b.to_string());
@@ -594,14 +613,17 @@ fn sanitize_message(msg: Message) -> anyhow::Result<EmailMessage> {
                 body,
             }
         })
-        .context("No raw message found")
+        .context(format!(
+            "No raw message found in message response: {:?}",
+            msg
+        ))
 }
 
 fn build_label_update(
     user_labels: Vec<Label>,
     current_labels: Vec<String>,
     category: Category,
-    inbox_settings: &HashMap<String, PartialInboxSetting>,
+    inbox_settings: &CategoryInboxSettingsMap,
 ) -> anyhow::Result<(serde_json::Value, LabelUpdate)> {
     static RE_CATEGORY_LABEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"CATEGORY_+").unwrap());
 

@@ -6,12 +6,12 @@ use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::ServerState;
 
-use super::processor::EmailProcessor;
+use crate::email::processor::EmailProcessor;
 
 struct ActiveEmailProcessors {
     server_state: ServerState,
     waiting_queue: IndexSet<String>,
-    email_to_active_proc: HashMap<String, Arc<RwLock<EmailProcessor>>>,
+    email_to_active_proc: HashMap<String, Arc<EmailProcessor>>,
     max_size: usize,
 }
 
@@ -32,18 +32,9 @@ impl ActiveEmailProcessors {
         if let Some(proc) = self.email_to_active_proc.get(&email_address) {
             let proc = proc.clone();
             tokio::spawn(async move {
-                let new_email_ids = {
-                    let proc = proc.read().await;
-                    proc.fetch_new_email_ids().await.unwrap_or_else(|e| {
-                        tracing::error!("Error fetching new email ids: {:?}", e);
-                        vec![]
-                    })
-                };
-                if new_email_ids.is_empty() {
-                    return;
-                }
-                let mut proc = proc.write().await;
-                proc.add_email_ids_to_queue(new_email_ids);
+                proc.queue_new_emails().await.unwrap_or_else(|e| {
+                    tracing::error!("Error queueing new emails: {:?}", e);
+                });
             });
 
             return Ok(());
@@ -54,24 +45,18 @@ impl ActiveEmailProcessors {
             return Ok(());
         }
 
-        let proc = Arc::new(RwLock::new(
+        let proc = Arc::new(
             EmailProcessor::from_email_address(self.server_state.clone(), &email_address)
                 .await
                 .map_err(|e| anyhow!("Could not create email processor {:?}", e))?,
-        ));
+        );
         {
             let proc = proc.clone();
             tokio::spawn(async move {
-                {
-                    let mut proc = proc.write().await;
-                    proc.queue_new_emails()
-                        .await
-                        .unwrap_or_else(|e| tracing::error!("Error queuing emails: {:?}", e));
-                    // Drop write lock here
-                }
-                proc.read()
-                    .await
-                    .process_emails_in_queue()
+                proc.queue_new_emails().await.unwrap_or_else(|e| {
+                    tracing::error!("Error queueing new emails: {:?}", e);
+                });
+                proc.process_emails_in_queue()
                     .await
                     .unwrap_or_else(|e| tracing::error!("Error processing emails: {:?}", e));
             });
@@ -113,15 +98,19 @@ impl ActiveEmailProcessors {
         let mut display_str = "Email Processing Queue Status:\n".to_string();
         if self.email_to_active_proc.is_empty() {
             display_str.push_str("No active processors\n");
+        } else {
+            display_str.push_str(&format!(
+                "Active Processors:{}\n",
+                self.email_to_active_proc.len()
+            ));
         }
-        display_str.push_str(&format!("Users waiting: {}\n", self.waiting_queue.len()));
-        display_str.push_str(&format!(
-            "Active Processors: {}\n",
-            self.email_to_active_proc.len()
-        ));
+        if self.waiting_queue.is_empty() {
+            display_str.push_str("No users waiting\n");
+        } else {
+            display_str.push_str(&format!("Users waiting:{}\n", self.waiting_queue.len()));
+        }
 
         for (email, proc) in self.email_to_active_proc.iter() {
-            let proc = proc.read().await;
             let status = proc.status();
             display_str.push_str(&format!("\t{} -> {}\n", email, status));
         }
@@ -131,7 +120,6 @@ impl ActiveEmailProcessors {
     pub async fn cleanup_finished_processors(&mut self) {
         let mut to_remove = vec![];
         for (email, proc) in self.email_to_active_proc.iter() {
-            let proc = proc.read().await;
             if proc.check_is_processing() {
                 continue;
             }

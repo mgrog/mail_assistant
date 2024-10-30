@@ -140,8 +140,6 @@ pub async fn handler_auth_gmail_callback(
         }
     }
 
-    configure_default_inbox_settings(&state, user_session.id).await?;
-
     Ok(Json(json!({
         "message": "Login success",
     })))

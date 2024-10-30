@@ -1,3 +1,3 @@
-pub mod inbox_settings;
+pub mod inbox;
 pub mod prelude;
-pub mod user_settings;
+pub mod user;

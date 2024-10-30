@@ -1,5 +1,5 @@
-use super::inbox_settings;
-use super::user_settings;
+use super::inbox;
+use super::user;
 
-pub use inbox_settings::*;
-pub use user_settings::*;
+pub use inbox::*;
+pub use user::*;

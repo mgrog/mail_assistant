@@ -194,7 +194,7 @@ pub fn email_processing_queue_cleanup(queue: ActiveProcessingQueue) -> JoinHandl
 
         loop {
             // -- DEBUG
-            tracing::info!("Starting email processing queue cleanup task");
+            // tracing::info!("Starting email processing queue cleanup task");
             // -- DEBUG
             interval.tick().await;
             queue.cleanup_finished_processors().await;

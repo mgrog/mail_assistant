@@ -4371,6 +4371,8 @@ dependencies = [
  "mail-parser",
  "mimalloc",
  "minijinja",
+ "num-derive",
+ "num-traits",
  "once_cell",
  "regex",
  "reqwest",

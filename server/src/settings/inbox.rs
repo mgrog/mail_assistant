@@ -1,29 +1,99 @@
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use entity::prelude::*;
 use futures::future::join_all;
+use sea_orm::DatabaseConnection;
 
 use crate::db_core::prelude::*;
-use crate::model::error::AppError;
-use crate::model::error::AppResult;
 use crate::ServerState;
+
+#[derive(Debug, Copy, Clone)]
+pub struct CategoryInboxSetting {
+    pub skip_inbox: bool,
+    pub mark_spam: bool,
+}
+
+pub type CategoryInboxSettingsMap = HashMap<String, CategoryInboxSetting>;
+
+pub fn default_inbox_settings() -> CategoryInboxSettingsMap {
+    HashMap::from([
+        (
+            "ads".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "political".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "notices".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "receipts".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "security_alerts".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "flights".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "finances".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+        (
+            "social_media".to_string(),
+            CategoryInboxSetting {
+                skip_inbox: false,
+                mark_spam: false,
+            },
+        ),
+    ])
+}
 
 pub async fn configure_default_inbox_settings(
     state: &ServerState,
     user_session_id: i32,
-) -> AppResult<()> {
+) -> anyhow::Result<()> {
     let handles = [
         inbox_settings::ActiveModel {
             id: ActiveValue::NotSet,
             user_session_id: ActiveValue::Set(user_session_id),
             category: ActiveValue::Set("ads".to_string()),
-            skip_inbox: ActiveValue::Set(true),
+            skip_inbox: ActiveValue::Set(false),
             mark_spam: ActiveValue::Set(false),
         },
         inbox_settings::ActiveModel {
             id: ActiveValue::NotSet,
             user_session_id: ActiveValue::Set(user_session_id),
             category: ActiveValue::Set("political".to_string()),
-            skip_inbox: ActiveValue::Set(true),
+            skip_inbox: ActiveValue::Set(false),
             mark_spam: ActiveValue::Set(false),
         },
         inbox_settings::ActiveModel {
@@ -65,7 +135,7 @@ pub async fn configure_default_inbox_settings(
             id: ActiveValue::NotSet,
             user_session_id: ActiveValue::Set(user_session_id),
             category: ActiveValue::Set("social_media".to_string()),
-            skip_inbox: ActiveValue::Set(true),
+            skip_inbox: ActiveValue::Set(false),
             mark_spam: ActiveValue::Set(false),
         },
     ]
@@ -91,11 +161,34 @@ pub async fn configure_default_inbox_settings(
                     // Ignore this error
                     Ok(())
                 }
-                _ => Err(AppError::Internal(anyhow!("Database error: {:?}", error))),
+                _ => Err(anyhow!("Database error: {:?}", error)),
             },
             Err(e) => Err(e.into()),
         }?;
     }
 
     Ok(())
+}
+
+pub async fn get_user_inbox_settings(
+    conn: &DatabaseConnection,
+    user_session_id: i32,
+) -> anyhow::Result<CategoryInboxSettingsMap> {
+    let settings = InboxSettings::find()
+        .filter(inbox_settings::Column::UserSessionId.eq(user_session_id))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|cs| {
+            (
+                cs.category,
+                CategoryInboxSetting {
+                    skip_inbox: cs.skip_inbox,
+                    mark_spam: cs.mark_spam,
+                },
+            )
+        })
+        .collect();
+
+    Ok(settings)
 }

@@ -4,8 +4,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use num_derive::{FromPrimitive, ToPrimitive};
 use serde_json::json;
+use sqlx::error::DatabaseError;
 
+use crate::db_core::prelude::*;
 use crate::server_config::cfg;
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -173,4 +176,23 @@ impl IntoResponse for AppError {
 
         err.into_response()
     }
+}
+
+#[allow(clippy::borrowed_box)]
+fn get_code(error: &Box<dyn DatabaseError>) -> Option<u32> {
+    error.code().and_then(|c| c.parse::<u32>().ok())
+}
+
+pub fn extract_database_error_code(err: &sea_orm::error::DbErr) -> Option<u32> {
+    match err {
+        sea_orm::error::DbErr::Query(sea_orm::error::RuntimeErr::SqlxError(
+            sqlx::Error::Database(error),
+        )) => get_code(error),
+        _ => None,
+    }
+}
+
+#[derive(FromPrimitive, ToPrimitive, Debug, PartialEq, Eq)]
+pub enum DatabaseErrorCode {
+    UniqueViolation = 23505,
 }

@@ -45,6 +45,8 @@ tokio-util = "0.7.12"
 google-cloud-googleapis = "0.15.0"
 chrono-tz = "0.10.0"
 derive_more = { version = "1.0.0", features = ["display"] }
+num-derive = "0.4.2"
+num-traits = "0.2.19"
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

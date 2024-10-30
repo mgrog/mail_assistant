@@ -64,6 +64,7 @@ pub struct TokenLimits {
 #[allow(dead_code)]
 pub struct Settings {
     pub training_mode: bool,
+    pub email_max_age_days: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
