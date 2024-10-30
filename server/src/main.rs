@@ -16,32 +16,23 @@ mod settings;
 use std::{
     env,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc,
-    },
+    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 
 use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, routing::get, Router};
 use cron_time_utils::parse_offset_str;
 use email::{
-    active_email_processors::ActiveProcessingQueue,
-    tasks::{email_processing_queue_cleanup, process_emails_from_inbox_notifications},
+    active_email_processors::ActiveProcessingQueue, tasks::email_processing_queue_cleanup,
 };
 use entity::prelude::*;
 use futures::future::join_all;
-use google_cloud_pubsub::{
-    client::google_cloud_auth::credentials::CredentialsFile, subscription::SubscriptionConfig,
-};
 use mimalloc::MiMalloc;
-use model::response::GmailWatchInboxPushNotification;
 use rate_limiters::RateLimiters;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait};
 use std::sync::atomic::Ordering::Relaxed;
-use tokio::{signal, sync::mpsc, task::JoinHandle};
+use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tokio_util::sync::CancellationToken;
 use tower_cookies::CookieManagerLayer;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -80,107 +71,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Database connection failed");
 
-    // let creds =
-    //     CredentialsFile::new_from_file(format!("{}/google_creds.json", env!("CARGO_MANIFEST_DIR")))
-    //         .await
-    //         .expect("Failed to create credentials file");
-
-    // let pubsub_config = google_cloud_pubsub::client::ClientConfig::default()
-    //     .with_credentials(creds)
-    //     .await
-    //     .expect("Failed to create pubsub client config");
-
-    // let pubsub_client = Arc::new(
-    //     google_cloud_pubsub::client::Client::new(pubsub_config)
-    //         .await
-    //         .expect("Failed to create pubsub client"),
-    // );
-
-    // Topic for user mailboxes
-    // let topic = pubsub_client.topic("mailclerk-user-inboxes");
-
-    // Create subscription to user mailbox topic
-    // let subscription = pubsub_client.subscription("user-inboxes-subscription");
-    // if !subscription
-    //     .exists(None)
-    //     .await
-    //     .expect("Failed to check if subscription exists")
-    // {
-    //     match subscription
-    //         .create(
-    //             topic.fully_qualified_name(),
-    //             SubscriptionConfig::default(),
-    //             None,
-    //         )
-    //         .await
-    //     {
-    //         Ok(_) => {
-    //             tracing::info!("Created inbox subscription");
-    //         }
-    //         Err(e) => {
-    //             tracing::error!("Failed to create inbox subscription: {:?}", e);
-    //         }
-    //     };
-    // } else {
-    //     tracing::info!("Inbox subscription already exists");
-    // }
-
-    // let (inbox_sender, inbox_receiver) = mpsc::channel::<GmailWatchInboxPushNotification>(100_000);
-
-    // let cancel_inbox_subscription = CancellationToken::new();
-    // let is_subscription_cleaned_up = Arc::new(AtomicBool::new(false));
-    // tracing::info!("Building inbox subscription listener");
-    // let inbox_subscription_handle = {
-    //     let cancel = cancel_inbox_subscription.clone();
-    //     let is_subscription_cleaned_up = is_subscription_cleaned_up.clone();
-    //     tracing::info!("Starting inbox subscription listener");
-    //     let inbox_sender = inbox_sender.clone();
-    //     tokio::spawn(async move {
-    //         tracing::info!("Listening for inbox messages...");
-    //         let sub = subscription
-    //             .receive(
-    //                 move |message, _cancel| {
-    //                     let data_result = serde_json::from_str::<GmailWatchInboxPushNotification>(
-    //                         &String::from_utf8_lossy(message.message.data.as_slice()),
-    //                     );
-    //                     let inbox_sender = inbox_sender.clone();
-    //                     async move {
-    //                         match data_result {
-    //                             Ok(data) => {
-    //                                 tracing::info!("Received inbox message: {:?}", data);
-    //                                 let _ = inbox_sender.send(data).await;
-    //                                 let _ = message.ack().await;
-    //                             }
-    //                             Err(e) => {
-    //                                 let raw =
-    //                                     String::from_utf8_lossy(message.message.data.as_slice());
-    //                                 tracing::error!(
-    //                                     "Failed to parse inbox message: {}\n{:?}",
-    //                                     raw,
-    //                                     e
-    //                                 );
-    //                             }
-    //                         }
-    //                     }
-    //                 },
-    //                 cancel,
-    //                 None,
-    //             )
-    //             .await;
-
-    //         match sub {
-    //             Ok(_) => {
-    //                 tracing::info!("Subscription ended");
-    //             }
-    //             Err(e) => {
-    //                 tracing::info!("Subscription error: {:?}", e);
-    //             }
-    //         };
-    //         subscription.delete(None).await.unwrap();
-    //         is_subscription_cleaned_up.store(true, Relaxed);
-    //     })
-    // };
-
     let state = ServerState {
         http_client: reqwest::Client::new(),
         conn,
@@ -217,8 +107,6 @@ async fn main() -> anyhow::Result<()> {
 
     let email_processing_queue = ActiveProcessingQueue::new(state.clone(), 1_000);
     let queue_watch_handle = email_processing_queue.watch().await;
-    // let process_emails_from_inbox_notifications_task =
-    //     process_emails_from_inbox_notifications(inbox_receiver, email_processing_queue.clone());
     let processor_cleanup_handle = email_processing_queue_cleanup(email_processing_queue.clone());
 
     let mut scheduler = JobScheduler::new()
@@ -385,12 +273,6 @@ async fn main() -> anyhow::Result<()> {
             signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
             tracing::info!("Received Ctrl+C, shutting down");
             scheduler.shutdown().await.unwrap();
-            // cancel_inbox_subscription.cancel();
-            // println!("Waiting to clean inbox subscription...");
-            // while !is_subscription_cleaned_up.load(Relaxed) {
-            //     tokio::time::sleep(Duration::from_millis(10)).await;
-            // }
-            // println!("Inbox subscription deleted");
             println!("Cleanups done, shutting down");
             std::process::exit(0);
         })

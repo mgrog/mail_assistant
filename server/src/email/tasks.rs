@@ -6,12 +6,10 @@ use entity::{prelude::*, user_session};
 use futures::future::join_all;
 use futures::FutureExt;
 use sea_orm::{entity::*, query::*, DatabaseConnection};
-use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::model::daily_email_summary::DailyEmailSentStatus;
-use crate::model::response::GmailWatchInboxPushNotification;
 use crate::{
     model::error::{AppError, AppResult},
     HttpClient, ServerState,
@@ -152,42 +150,6 @@ pub async fn subscribe_to_inboxes(
     Ok(())
 }
 
-pub fn process_emails_from_inbox_notifications(
-    mut inbox_receiver: Receiver<GmailWatchInboxPushNotification>,
-    processing_queue: ActiveProcessingQueue,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(notification) = inbox_receiver.recv().await {
-            // Notifications are spammed when mailclerk is running, so just ignore them
-            if processing_queue
-                .has_email(&notification.email_address)
-                .await
-            {
-                continue;
-            }
-
-            match processing_queue
-                .add_to_processing(notification.email_address.clone())
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!(
-                        "Added email {} to processing queue",
-                        notification.email_address
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to add email {} to processing queue: {:?}",
-                        notification.email_address,
-                        e
-                    );
-                }
-            };
-        }
-    })
-}
-
 pub fn email_processing_queue_cleanup(queue: ActiveProcessingQueue) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(5));
@@ -201,17 +163,3 @@ pub fn email_processing_queue_cleanup(queue: ActiveProcessingQueue) -> JoinHandl
         }
     })
 }
-
-// pub async fn run_email_processors(processing_queue: ActiveProcessingQueue) -> JoinHandle<()> {
-//     tokio::spawn(async move {
-//         let mut all_handles = vec![];
-//         loop {
-//             if processing_queue.is_empty().await {
-//                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-//                 continue;
-//             }
-
-//             processing_queue.process_emails_in_queue().await;
-//         }
-//     })
-// }

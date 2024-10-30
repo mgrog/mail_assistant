@@ -80,20 +80,6 @@ impl ActiveEmailProcessors {
         Ok(())
     }
 
-    // pub fn get_processor_by_email(
-    //     &self,
-    //     email_address: &str,
-    // ) -> Option<Arc<RwLock<EmailProcessor>>> {
-    //     self.email_to_active_proc.get(email_address).cloned()
-    // }
-
-    // pub fn get_all_processors(&self) -> Vec<Arc<RwLock<EmailProcessor>>> {
-    //     self.email_to_active_proc
-    //         .values()
-    //         .map(|proc| proc.clone())
-    //         .collect()
-    // }
-
     pub async fn get_queue_status(&self) {
         let mut display_str = "Email Processing Queue Status:\n".to_string();
         if self.email_to_active_proc.is_empty() {
@@ -149,30 +135,10 @@ impl ActiveProcessingQueue {
         }
     }
 
-    pub async fn has_email(&self, email_address: &str) -> bool {
-        let queue = self.active_processors.read().await;
-        queue.email_to_active_proc.contains_key(email_address)
-    }
-
     pub async fn add_to_processing(&self, email_address: String) -> anyhow::Result<()> {
         let mut queue = self.active_processors.write().await;
         queue.insert_processor(email_address.to_string()).await
     }
-
-    // pub async fn get_processor_status_by_email(&self, email_address: &str) -> bool {
-    //     let queue = self.active_processors.lock().await;
-    //     if let Some(proc) = queue.get_processor_by_email(email_address) {
-    //         let proc = proc.read().await;
-    //         proc.check_is_processing()
-    //     } else {
-    //         false
-    //     }
-    // }
-
-    // pub async fn is_empty(&self) -> bool {
-    //     let queue = self.active_processors.read().await;
-    //     queue.email_to_active_proc.is_empty()
-    // }
 
     pub async fn cleanup_finished_processors(&self) {
         let mut queue = self.active_processors.write().await;

@@ -1,7 +1,7 @@
 extern crate google_gmail1 as gmail;
 
 use crate::db_core::prelude::*;
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use axum::{
     extract::{Query, State},
     Json,

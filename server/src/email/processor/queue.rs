@@ -5,8 +5,6 @@ use std::{
 
 use indexmap::IndexSet;
 
-use super::parse_id_to_int;
-
 #[derive(Debug, Clone)]
 pub struct EmailProcessingQueue {
     queue: Arc<Mutex<IndexSet<u128>>>,
