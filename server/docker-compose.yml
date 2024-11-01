@@ -1,0 +1,8 @@
+version: "3.9"
+services:
+  mailclerk-server:
+    container_name: mailclerk-server
+    build:
+      context: ../
+      dockerfile: ./server/Dockerfile
+    image: mailclerk-server:latest

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{Duration, Utc};
-use entity::{prelude::*, processed_email, user_session};
+use entity::{prelude::*, processed_email, user_account_access};
 use google_gmail1::api::Message;
 use lettre::message::MultiPart;
 use minijinja::render;
@@ -11,41 +11,40 @@ use sea_orm::DatabaseConnection;
 
 use crate::{
     email::{client::EmailClient, email_template::DAILY_SUMMARY_EMAIL_TEMPLATE},
-    model::error::AppResult,
+    model::{error::AppResult, user_derivatives::UserWithAccountAccess},
     HttpClient,
 };
 
 pub struct DailySummaryMailer {
     conn: DatabaseConnection,
     http_client: HttpClient,
-    user_session: user_session::Model,
+    user: UserWithAccountAccess,
 }
 
 impl DailySummaryMailer {
     pub async fn new(
         conn: DatabaseConnection,
         http_client: HttpClient,
-        user_session: user_session::Model,
+        user: UserWithAccountAccess,
     ) -> AppResult<Self> {
         Ok(Self {
             conn,
             http_client,
-            user_session,
+            user,
         })
     }
 
     async fn build_and_send_summary(
         &self,
-        user_session: &user_session::Model,
         processed_emails: Vec<processed_email::Model>,
     ) -> anyhow::Result<()> {
-        tracing::info!("Sending daily email for user {}", user_session.email);
-        let raw_email = self.construct_daily_summary(&user_session.email, processed_emails)?;
+        tracing::info!("Sending daily email for user {}", self.user.email);
+        let raw_email = self.construct_daily_summary(&self.user.email, processed_emails)?;
 
         let email_client = EmailClient::new(
             self.http_client.clone(),
             self.conn.clone(),
-            user_session.clone(),
+            self.user.clone(),
         )
         .await?;
 
@@ -70,26 +69,22 @@ impl DailySummaryMailer {
 
     pub async fn send(&self) {
         let twenty_four_hours_ago = Utc::now() - Duration::hours(24);
-        let user_session = &self.user_session;
 
         match ProcessedEmail::find()
-            .filter(processed_email::Column::UserSessionId.eq(user_session.id))
+            .filter(processed_email::Column::UserId.eq(self.user.id))
             .filter(processed_email::Column::ProcessedAt.gt(twenty_four_hours_ago))
             .all(&self.conn)
             .await
         {
             Ok(processed_emails) if !processed_emails.is_empty() => {
-                match self
-                    .build_and_send_summary(user_session, processed_emails)
-                    .await
-                {
+                match self.build_and_send_summary(processed_emails).await {
                     Ok(_) => {
-                        tracing::info!("Daily email sent for user {}", user_session.email);
+                        tracing::info!("Daily email sent for user {}", self.user.email);
                     }
                     Err(e) => {
                         tracing::error!(
                             "Could not send daily email for user {}: {:?}",
-                            user_session.email,
+                            self.user.email,
                             e
                         );
                     }
@@ -97,12 +92,12 @@ impl DailySummaryMailer {
             }
             Ok(_) => {
                 // No emails to send
-                tracing::info!("No emails to send for user {}", user_session.email);
+                tracing::info!("No emails to send for user {}", self.user.email);
             }
             Err(e) => {
                 tracing::error!(
                     "Could not fetch emails for user {}: {:?}",
-                    user_session.email,
+                    self.user.email,
                     e
                 );
             }
@@ -116,7 +111,8 @@ impl DailySummaryMailer {
     ) -> anyhow::Result<Vec<u8>> {
         let mut category_counts = HashMap::new();
         for email in processed_emails {
-            let labels = email.labels_applied;
+            let labels = email.labels_applied.unwrap_or_default();
+
             let label = labels
                 .iter()
                 .find(|label| label.contains("mailclerk:"))
@@ -193,11 +189,11 @@ mod tests {
         let dt: DateTime<Utc> = DateTime::from_str("2024-10-07 20:04:19 +00:00").unwrap();
 
         let query = ProcessedEmail::find()
-            .filter(processed_email::Column::UserSessionId.eq(1))
+            .filter(processed_email::Column::UserId.eq(1))
             .filter(processed_email::Column::ProcessedAt.gt(dt))
             .build(DbBackend::Postgres)
             .to_string();
 
-        assert_eq!(query, "SELECT \"processed_email\".\"id\", \"processed_email\".\"user_session_id\", \"processed_email\".\"user_session_email\", \"processed_email\".\"processed_at\", \"processed_email\".\"labels_applied\", \"processed_email\".\"labels_removed\", \"processed_email\".\"ai_answer\" FROM \"processed_email\" WHERE \"processed_email\".\"user_session_id\" = 1 AND \"processed_email\".\"processed_at\" > '2024-10-07 20:04:19 +00:00'");
+        assert_eq!(query, "SELECT \"processed_email\".\"id\", \"processed_email\".\"user_account_access_id\", \"processed_email\".\"user_account_access_email\", \"processed_email\".\"processed_at\", \"processed_email\".\"labels_applied\", \"processed_email\".\"labels_removed\", \"processed_email\".\"ai_answer\" FROM \"processed_email\" WHERE \"processed_email\".\"user_account_access_id\" = 1 AND \"processed_email\".\"processed_at\" > '2024-10-07 20:04:19 +00:00'");
     }
 }

@@ -7,28 +7,28 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    pub user_session_id: i32,
+    pub user_id: i32,
     pub processed_at: DateTimeWithTimeZone,
-    pub labels_applied: Vec<String>,
-    pub labels_removed: Vec<String>,
+    pub labels_applied: Option<Vec<String>>,
+    pub labels_removed: Option<Vec<String>>,
     pub ai_answer: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::user_session::Entity",
-        from = "Column::UserSessionId",
-        to = "super::user_session::Column::Id",
+        belongs_to = "super::user::Entity",
+        from = "Column::UserId",
+        to = "super::user::Column::Id",
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    UserSession,
+    User,
 }
 
-impl Related<super::user_session::Entity> for Entity {
+impl Related<super::user::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::UserSession.def()
+        Relation::User.def()
     }
 }
 

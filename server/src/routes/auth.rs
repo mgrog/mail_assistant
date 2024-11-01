@@ -1,13 +1,13 @@
 extern crate google_gmail1 as gmail;
 
-use crate::db_core::prelude::*;
+use crate::db_core::{prelude::*, queries::configure_default_user_settings};
 use anyhow::Context;
 use axum::{
     extract::{Query, State},
     Json,
 };
 use chrono::DateTime;
-use entity::user_session::Column::*;
+use entity::user_account_access::Column::*;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -18,7 +18,6 @@ use crate::{
         response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
     },
     server_config::{cfg, GmailConfig},
-    settings::prelude::*,
     HttpClient, ServerState,
 };
 
@@ -108,9 +107,23 @@ pub async fn handler_auth_gmail_callback(
         .email_address
         .context("Profile email not found. An email address is required")?;
 
-    let session = user_session::ActiveModel {
+    User::insert(user::ActiveModel {
         id: ActiveValue::NotSet,
-        email: ActiveValue::Set(email),
+        email: ActiveValue::Set(email.clone()),
+        created_at: ActiveValue::NotSet,
+        updated_at: ActiveValue::NotSet,
+        subscription_status: ActiveValue::NotSet,
+        last_payment_attempt_at: ActiveValue::NotSet,
+        last_successful_payment_at: ActiveValue::NotSet,
+        last_sync: ActiveValue::NotSet,
+    })
+    .on_conflict_do_nothing()
+    .exec(&state.conn)
+    .await?;
+
+    let account_access = user_account_access::ActiveModel {
+        id: ActiveValue::NotSet,
+        user_email: ActiveValue::Set(email),
         access_token: ActiveValue::Set(resp.access_token.clone()),
         refresh_token: ActiveValue::Set(resp.refresh_token.clone()),
         expires_at: ActiveValue::Set(DateTime::from(
@@ -118,19 +131,17 @@ pub async fn handler_auth_gmail_callback(
         )),
         created_at: ActiveValue::NotSet,
         updated_at: ActiveValue::NotSet,
-        active: ActiveValue::NotSet,
-        last_sync: ActiveValue::NotSet,
     };
-    let user_session = UserSession::insert(session)
+    let user_account_access = UserAccountAccess::insert(account_access)
         .on_conflict(
-            OnConflict::column(Email)
+            OnConflict::column(UserEmail)
                 .update_columns([AccessToken, RefreshToken, ExpiresAt, UpdatedAt])
                 .to_owned(),
         )
         .exec_with_returning(&state.conn)
         .await?;
 
-    match configure_default_user_settings(&state, user_session.id).await {
+    match configure_default_user_settings(&state, &user_account_access.user_email).await {
         Ok(_) => {}
         Err(AppError::Conflict(_)) => {
             tracing::info!("User settings already exists");

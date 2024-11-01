@@ -11,7 +11,6 @@ mod rate_limiters;
 mod request_tracing;
 mod routes;
 mod server_config;
-mod settings;
 
 use std::{
     env,
@@ -20,16 +19,17 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, routing::get, Router};
 use cron_time_utils::parse_offset_str;
+use db_core::prelude::*;
 use email::{
     active_email_processors::ActiveProcessingQueue, tasks::email_processing_queue_cleanup,
 };
-use entity::prelude::*;
 use futures::future::join_all;
 use mimalloc::MiMalloc;
 use rate_limiters::RateLimiters;
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -77,11 +77,6 @@ async fn main() -> anyhow::Result<()> {
         token_count: Arc::new(AtomicU64::new(0)),
         rate_limiters: RateLimiters::from_env(),
     };
-
-    // Watch user inboxes
-    email::tasks::subscribe_to_inboxes(state.conn.clone(), state.http_client.clone())
-        .await
-        .expect("Failed to subscribe to inboxes");
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_env("RUST_LOG"))
@@ -169,12 +164,13 @@ async fn main() -> anyhow::Result<()> {
             })?)
             .await?;
 
-        let user_settings = UserSettings::find()
+        let user_settings_with_active_subscriptions = UserSettings::find()
+            .find_also_related(User)
+            .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
             .all(&state.conn)
-            .await
-            .expect("Failed to fetch user settings");
+            .await?;
 
-        for user_setting in user_settings {
+        for (user_setting, user) in user_settings_with_active_subscriptions {
             let state = state.clone();
             let offset = match parse_offset_str(&user_setting.user_time_zone_offset) {
                 Ok(offset) => offset,
@@ -183,10 +179,11 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
+            let user = user.context("User not found")?;
 
             tracing::info!(
                 "Adding daily summary mailer job for user {} at {}{}",
-                user_setting.user_session_id,
+                user_setting.user_email,
                 user_setting.daily_summary_time,
                 user_setting.user_time_zone_offset
             );
@@ -197,11 +194,7 @@ async fn main() -> anyhow::Result<()> {
                     Job::new_async_tz(cron_time, offset, move |uuid, mut l| {
                         let state = state.clone();
                         Box::pin(async move {
-                            match email::tasks::send_user_daily_email_summary(
-                                &state,
-                                user_setting.user_session_id,
-                            )
-                            .await
+                            match email::tasks::send_user_daily_email_summary(&state, user.id).await
                             {
                                 Ok(_) => {
                                     tracing::info!("Daily summary mailer job {} succeeded", uuid);

@@ -11,24 +11,25 @@ pub struct Model {
     pub tokens_consumed: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub user_session_id: i32,
+    #[sea_orm(unique)]
+    pub user_email: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::user_session::Entity",
-        from = "Column::UserSessionId",
-        to = "super::user_session::Column::Id",
-        on_update = "NoAction",
-        on_delete = "Cascade"
+        belongs_to = "super::user::Entity",
+        from = "Column::UserEmail",
+        to = "super::user::Column::Email",
+        on_update = "Cascade",
+        on_delete = "Restrict"
     )]
-    UserSession,
+    User,
 }
 
-impl Related<super::user_session::Entity> for Entity {
+impl Related<super::user::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::UserSession.def()
+        Relation::User.def()
     }
 }
 

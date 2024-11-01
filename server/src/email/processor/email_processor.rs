@@ -7,9 +7,9 @@ use std::{
 };
 
 use super::queue::{EmailProcessingQueue, EmailQueueStatus};
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use derive_more::Display;
-use entity::{email_training, prelude::*, processed_email, user_session, user_token_usage_stats};
+use entity::{email_training, prelude::*, processed_email, user, user_token_usage_stats};
 use futures::future::join_all;
 use num_traits::FromPrimitive;
 use sea_orm::{
@@ -19,8 +19,12 @@ use sea_orm::{
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::{
+    db_core::queries::get_user_with_account_access_by_email,
     email::client::EmailClient,
-    model::error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
+    model::{
+        error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
+        user_derivatives::UserWithAccountAccess,
+    },
     server_config::{cfg, UNKNOWN_CATEGORY},
     ServerState,
 };
@@ -47,10 +51,11 @@ pub struct EmailProcessorStatusUpdate {
     pub num_in_processing: i64,
 }
 
-// This struct processes emails for a single user
 #[derive(Clone)]
+// This struct processes emails for a single user
 pub struct EmailProcessor {
-    pub user_session_id: i32,
+    pub user_id: i32,
+    pub user_account_access_id: i32,
     pub email_address: String,
     processed_email_count: Arc<AtomicI64>,
     failed_email_count: Arc<AtomicI64>,
@@ -63,28 +68,29 @@ pub struct EmailProcessor {
 }
 
 impl EmailProcessor {
-    pub async fn new(
-        server_state: ServerState,
-        user_session: user_session::Model,
-    ) -> AppResult<Self> {
+    pub async fn new(server_state: ServerState, user: UserWithAccountAccess) -> AppResult<Self> {
+        let user_id = user.id;
+        let user_account_access_id = user.user_account_access_id;
+        let email_address = user.email.clone();
+
         let email_client = EmailClient::new(
             server_state.http_client.clone(),
             server_state.conn.clone(),
-            user_session.clone(),
+            user,
         )
         .await
-        .context(format!(
-            "Could not create email client for: {}",
-            user_session.email
-        ))?;
+        .map_err(|e| {
+            AppError::Internal(anyhow!(
+                "Could not create email client for: {}, error: {}",
+                email_address,
+                e.to_string()
+            ))
+        })?;
 
-        tracing::info!(
-            "Email client created successfully for {}",
-            user_session.email
-        );
+        tracing::info!("Email client created successfully for {}", email_address);
 
         let quota_used = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserSessionId.eq(user_session.id))
+            .filter(user_token_usage_stats::Column::UserEmail.eq(email_address.clone()))
             .filter(user_token_usage_stats::Column::Date.eq(chrono::Utc::now().date_naive()))
             .one(&server_state.conn)
             .await?
@@ -98,8 +104,9 @@ impl EmailProcessor {
         // -- DEBUG
 
         let processor = EmailProcessor {
-            user_session_id: user_session.id,
-            email_address: user_session.email,
+            user_id,
+            user_account_access_id,
+            email_address,
             processed_email_count: Arc::new(AtomicI64::new(0)),
             failed_email_count: Arc::new(AtomicI64::new(0)),
             server_state,
@@ -117,19 +124,14 @@ impl EmailProcessor {
         server_state: ServerState,
         email_address: &str,
     ) -> AppResult<Self> {
-        let user_session = UserSession::find()
-            .filter(user_session::Column::Email.eq(email_address))
-            .filter(user_session::Column::Active.eq(true))
-            .one(&server_state.conn)
-            .await?
-            .context("Could not find active user session")?;
+        let user = get_user_with_account_access_by_email(&server_state.conn, email_address).await?;
 
-        Self::new(server_state, user_session).await
+        Self::new(server_state, user).await
     }
 
     pub async fn update_last_sync_time(&self) -> anyhow::Result<()> {
-        UserSession::update(user_session::ActiveModel {
-            id: ActiveValue::Set(self.user_session_id),
+        User::update(user::ActiveModel {
+            id: ActiveValue::Set(self.user_id),
             last_sync: ActiveValue::Set(Some(chrono::Utc::now().into())),
             ..Default::default()
         })
@@ -294,7 +296,7 @@ impl EmailProcessor {
 
         match ProcessedEmail::insert(processed_email::ActiveModel {
             id: ActiveValue::Set(email_id.clone()),
-            user_session_id: ActiveValue::Set(self.user_session_id),
+            user_id: ActiveValue::Set(self.user_id),
             labels_applied: ActiveValue::Set(label_update.added),
             labels_removed: ActiveValue::Set(label_update.removed),
             ai_answer: ActiveValue::Set(category_content),
@@ -322,6 +324,10 @@ impl EmailProcessor {
 
     pub async fn process_emails_in_queue(&self) -> anyhow::Result<()> {
         if self.is_quota_reached() {
+            return Ok(());
+        }
+
+        if self.email_queue.is_empty() {
             return Ok(());
         }
 
@@ -418,7 +424,7 @@ impl EmailProcessor {
 
         // Update the user's token usage in the database
         let existing = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserSessionId.eq(self.user_session_id))
+            .filter(user_token_usage_stats::Column::UserEmail.eq(self.email_address.clone()))
             .filter(user_token_usage_stats::Column::Date.eq(chrono::Utc::now().date_naive()))
             .one(&self.server_state.conn)
             .await?;
@@ -442,7 +448,7 @@ impl EmailProcessor {
         } else {
             let insertion = UserTokenUsageStats::insert(user_token_usage_stats::ActiveModel {
                 id: ActiveValue::NotSet,
-                user_session_id: ActiveValue::Set(self.user_session_id),
+                user_email: ActiveValue::Set(self.email_address.clone()),
                 tokens_consumed: ActiveValue::Set(tokens),
                 date: ActiveValue::NotSet,
                 created_at: ActiveValue::NotSet,

@@ -19,8 +19,8 @@ pub struct GmailApiRefreshTokenResponse {
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LabelUpdate {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
+    pub added: Option<Vec<String>>,
+    pub removed: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

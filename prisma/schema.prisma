@@ -1,0 +1,106 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model email_training {
+  id              Int     @id @default(autoincrement())
+  user_email      String  @db.VarChar
+  email_id        String  @unique @db.VarChar
+  from            String  @db.VarChar
+  subject         String  @db.VarChar
+  body            String
+  ai_answer       String  @db.VarChar
+  confidence      Float   @db.Real
+  heuristics_used Boolean @default(false)
+}
+
+model inbox_settings {
+  id         Int     @id @default(autoincrement())
+  user_id    Int
+  category   String  @db.VarChar
+  skip_inbox Boolean
+  mark_spam  Boolean
+  user       user    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([category, user_id])
+  @@index([user_id])
+}
+
+model processed_daily_summary {
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  user       user     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id])
+}
+
+model processed_email {
+  id             String   @id @db.VarChar
+  user_id        Int
+  processed_at   DateTime @default(now()) @db.Timestamptz(6)
+  labels_applied String[] @default([])
+  labels_removed String[] @default([])
+  ai_answer      String   @db.VarChar
+  user           user     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id])
+}
+
+model user_account_access {
+  id            Int      @id @default(autoincrement())
+  access_token  String   @db.VarChar
+  refresh_token String   @db.VarChar
+  expires_at    DateTime @db.Timestamptz(6)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @default(now()) @db.Timestamptz(6)
+  user_email    String   @unique @db.VarChar
+  user          user     @relation(fields: [user_email], references: [email])
+}
+
+model user_settings {
+  id                    Int     @id @default(autoincrement())
+  daily_summary_enabled Boolean @default(true)
+  daily_summary_time    String  @default("06:00") @db.VarChar
+  user_time_zone_offset String  @default("-08") @db.VarChar
+  user_email            String  @unique @db.VarChar
+  user                  user    @relation(fields: [user_email], references: [email])
+}
+
+model user_token_usage_stats {
+  id              Int      @id @default(autoincrement())
+  date            DateTime @default(dbgenerated("CURRENT_DATE")) @db.Date
+  tokens_consumed BigInt   @default(0)
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime @default(now()) @db.Timestamptz(6)
+  user_email      String   @unique @db.VarChar
+  user            user     @relation(fields: [user_email], references: [email])
+
+  @@unique([date, user_email])
+  @@index([date])
+}
+
+enum subscription_status {
+  ACTIVE
+  CANCELLED
+  PAST_DUE
+  UNPAID
+}
+
+model user {
+  id                         Int                       @id @default(autoincrement())
+  email                      String                    @unique @db.VarChar
+  subscription_status        subscription_status       @default(UNPAID)
+  last_successful_payment_at DateTime?                 @db.Timestamptz(6)
+  last_payment_attempt_at    DateTime?                 @db.Timestamptz(6)
+  created_at                 DateTime                  @default(now()) @db.Timestamptz(6)
+  updated_at                 DateTime                  @default(now()) @db.Timestamptz(6)
+  inbox_settings             inbox_settings[]
+  processed_daily_summary    processed_daily_summary[]
+  processed_email            processed_email[]
+  user_token_usage_stats     user_token_usage_stats[]
+  user_settings              user_settings?
+  user_account_access        user_account_access?
+  last_sync                  DateTime?                 @db.Timestamptz(6)
+}

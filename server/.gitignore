@@ -1,5 +1,5 @@
 /target
 client_secret.*
 api_key.txt
-config.toml
+config*.toml
 google_creds.json

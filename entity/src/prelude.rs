@@ -4,6 +4,7 @@ pub use super::email_training::Entity as EmailTraining;
 pub use super::inbox_settings::Entity as InboxSettings;
 pub use super::processed_daily_summary::Entity as ProcessedDailySummary;
 pub use super::processed_email::Entity as ProcessedEmail;
-pub use super::user_session::Entity as UserSession;
+pub use super::user::Entity as User;
+pub use super::user_account_access::Entity as UserAccountAccess;
 pub use super::user_settings::Entity as UserSettings;
 pub use super::user_token_usage_stats::Entity as UserTokenUsageStats;

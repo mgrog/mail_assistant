@@ -4,10 +4,15 @@ use std::{
     time::Duration,
 };
 
-use crate::db_core::prelude::*;
+use crate::{
+    db_core::{prelude::*, queries::get_user_inbox_settings},
+    model::{
+        settings_derivatives::{default_inbox_settings, CategoryInboxSettingsMap},
+        user_derivatives::UserWithAccountAccess,
+    },
+};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
-use entity::user_session;
 use futures::future::join_all;
 use google_gmail1::api::{
     Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
@@ -24,10 +29,6 @@ use crate::{
     model::response::LabelUpdate,
     routes::auth,
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
-    settings::{
-        self,
-        inbox::{default_inbox_settings, CategoryInboxSettingsMap},
-    },
 };
 
 macro_rules! gmail_url {
@@ -91,7 +92,7 @@ impl EmailClient {
     pub async fn new(
         http_client: reqwest::Client,
         conn: DatabaseConnection,
-        user_session: user_session::Model,
+        user: UserWithAccountAccess,
     ) -> anyhow::Result<EmailClient> {
         let rate_limiter = RateLimiter::builder()
             .initial(GMAIL_QUOTA_PER_SECOND)
@@ -99,14 +100,13 @@ impl EmailClient {
             .refill(GMAIL_QUOTA_PER_SECOND)
             .build();
 
-        let access_token = if user_session.expires_at < chrono::Utc::now() {
-            let resp =
-                auth::exchange_refresh_token(http_client.clone(), user_session.refresh_token)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Error refreshing token: {:?}", e))?;
+        let access_token = if user.expires_at < chrono::Utc::now() {
+            let resp = auth::exchange_refresh_token(http_client.clone(), user.refresh_token)
+                .await
+                .map_err(|e| anyhow::anyhow!("Error refreshing token: {:?}", e))?;
 
-            user_session::Entity::update(user_session::ActiveModel {
-                id: ActiveValue::Set(user_session.id),
+            UserAccountAccess::update(user_account_access::ActiveModel {
+                id: ActiveValue::Set(user.user_account_access_id),
                 access_token: ActiveValue::Set(resp.access_token.clone()),
                 expires_at: ActiveValue::Set(DateTime::from(
                     chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in as i64),
@@ -117,11 +117,12 @@ impl EmailClient {
             .await?;
             resp.access_token
         } else {
-            user_session.access_token
+            user.access_token
         };
 
-        let user_configured_settings =
-            settings::inbox::get_user_inbox_settings(&conn, user_session.id).await?;
+        let user_configured_settings = get_user_inbox_settings(&conn, user.id)
+            .await
+            .context("Could not find inbox settings")?;
 
         let mut category_inbox_settings = default_inbox_settings();
         category_inbox_settings.extend(user_configured_settings);
@@ -633,7 +634,7 @@ fn build_label_update(
         .cloned()
         .collect::<Vec<_>>();
 
-    let categories_to_add = category.gmail_categories;
+    let mut categories_to_add = category.gmail_categories;
 
     let mut categories_to_remove = current_categories
         .iter()
@@ -642,13 +643,12 @@ fn build_label_update(
         .collect::<Vec<_>>();
 
     if let Some(setting) = inbox_settings.get(&category.mail_label) {
-        if setting.skip_inbox {
-            categories_to_remove.push("INBOX".to_string());
-        }
-        // TODO: Implement spam marking
-        // if setting.mark_spam {
-        //
+        // if setting.skip_inbox {
+        //     categories_to_remove.push("INBOX".to_string());
         // }
+        if setting.mark_spam {
+            categories_to_add.push("SPAM".to_string());
+        }
     }
 
     let label_id = user_labels
@@ -682,8 +682,16 @@ fn build_label_update(
             }
         ),
         LabelUpdate {
-            added: label_names_applied,
-            removed: categories_to_remove,
+            added: if label_names_applied.is_empty() {
+                None
+            } else {
+                Some(label_names_applied)
+            },
+            removed: if categories_to_remove.is_empty() {
+                None
+            } else {
+                Some(categories_to_remove)
+            },
         },
     ))
 }
@@ -850,11 +858,11 @@ mod tests {
                 assert_eq!(
                     update,
                     super::LabelUpdate {
-                        added: vec![
+                        added: Some(vec![
                             "CATEGORY_PROMOTIONS".to_string(),
                             "mailclerk:ads".to_string()
-                        ],
-                        removed: vec!["CATEGORY_SOCIAL".to_string()]
+                        ]),
+                        removed: Some(vec!["CATEGORY_SOCIAL".to_string()])
                     }
                 );
             }

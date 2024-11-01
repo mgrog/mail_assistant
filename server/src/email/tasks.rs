@@ -2,13 +2,15 @@ use std::time::Duration;
 use std::vec;
 
 use anyhow::anyhow;
-use entity::{prelude::*, user_session};
+use entity::sea_orm_active_enums::SubscriptionStatus;
+use entity::{prelude::*, user};
 use futures::future::join_all;
 use futures::FutureExt;
 use sea_orm::{entity::*, query::*, DatabaseConnection};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
+use crate::db_core::queries::{get_user_with_account_access, get_users_with_active_subscriptions};
 use crate::model::daily_email_summary::DailyEmailSentStatus;
 use crate::{
     model::error::{AppError, AppResult},
@@ -24,22 +26,18 @@ pub async fn process_unsynced_user_emails(
     queue: ActiveProcessingQueue,
 ) -> AppResult<()> {
     let conn = &state.conn;
-    let user_sessions: Vec<_> = UserSession::find()
-        .filter(user_session::Column::Active.eq(true))
-        // .filter(
-        //     Condition::any()
-        //         .add(user_session::Column::LastSync.is_null())
-        //         .add(
-        //             user_session::Column::LastSync
-        //                 .lt(chrono::Utc::now() - chrono::Duration::hours(6)),
-        //         ),
-        // )
+    let user_accounts: Vec<_> = User::find()
+        .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
+        .find_also_related(UserAccountAccess)
         .all(conn)
-        .await?;
-
-    let tasks = user_sessions
+        .await?
         .into_iter()
-        .map(|user_session| queue.add_to_processing(user_session.email.clone()))
+        .filter_map(|(_, account_access)| account_access)
+        .collect();
+
+    let tasks = user_accounts
+        .into_iter()
+        .map(|access| queue.add_to_processing(access.user_email.clone()))
         .collect::<Vec<_>>();
 
     let mut successes = vec![];
@@ -68,51 +66,41 @@ pub async fn process_unsynced_user_emails(
 
 pub async fn send_user_daily_email_summary(
     state: &ServerState,
-    user_session_id: i32,
+    user_id: i32,
 ) -> AppResult<DailyEmailSentStatus> {
-    let user_session = UserSession::find()
-        .filter(user_session::Column::Id.eq(user_session_id))
-        .filter(user_session::Column::Active.eq(true))
-        .one(&state.conn)
-        .await?;
+    let user = get_user_with_account_access(&state.conn, user_id).await?;
 
-    if let Some(active_session) = user_session {
-        DailySummaryMailer::new(
-            state.conn.clone(),
-            state.http_client.clone(),
-            active_session,
-        )
+    let is_subscribed = user.subscription_status == SubscriptionStatus::Active;
+
+    if !is_subscribed {
+        return Ok(DailyEmailSentStatus::NotSent(
+            "User is not subscribed".to_string(),
+        ));
+    }
+
+    DailySummaryMailer::new(state.conn.clone(), state.http_client.clone(), user)
         .await?
         .send()
         .await;
 
-        Ok(DailyEmailSentStatus::Sent)
-    } else {
-        Ok(DailyEmailSentStatus::NotSent(
-            "User does not have an active session".to_string(),
-        ))
-    }
+    Ok(DailyEmailSentStatus::Sent)
 }
 
 pub async fn subscribe_to_inboxes(
     conn: DatabaseConnection,
     http_client: HttpClient,
 ) -> AppResult<()> {
-    let active_user_sessions = UserSession::find()
-        .filter(user_session::Column::Active.eq(true))
-        .all(&conn)
-        .await?;
+    let active_users = get_users_with_active_subscriptions(&conn).await?;
+    let accounts_to_subscribe = active_users.len();
 
-    let accounts_to_subscribe = active_user_sessions.len();
-
-    let mut tasks = active_user_sessions
+    let mut tasks = active_users
         .into_iter()
-        .map(|user_session| {
+        .map(|user| {
             let http_client = http_client.clone();
             let conn = conn.clone();
             async move {
-                let email = user_session.email.clone();
-                let client = EmailClient::new(http_client, conn, user_session).await?;
+                let email = user.email.clone();
+                let client = EmailClient::new(http_client, conn, user).await?;
                 let result = client.watch_mailbox().await?;
 
                 Ok::<_, AppError>((email, result))
