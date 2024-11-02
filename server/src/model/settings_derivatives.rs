@@ -1,13 +1,5 @@
 use std::collections::HashMap;
 
-use anyhow::anyhow;
-use entity::prelude::*;
-use futures::future::join_all;
-use sea_orm::DatabaseConnection;
-
-use crate::db_core::prelude::*;
-use crate::ServerState;
-
 #[derive(Debug, Copy, Clone)]
 pub struct CategoryInboxSetting {
     pub skip_inbox: bool,
