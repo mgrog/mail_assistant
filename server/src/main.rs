@@ -20,7 +20,7 @@ use std::{
 };
 
 use anyhow::Context;
-use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, Router};
 use cron_time_utils::parse_offset_str;
 use db_core::prelude::*;
 use email::{
@@ -29,12 +29,11 @@ use email::{
 use futures::future::join_all;
 use mimalloc::MiMalloc;
 use rate_limiters::RateLimiters;
+use routes::AppRouter;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tower_cookies::CookieManagerLayer;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[global_allocator]
@@ -83,23 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::Layer::default().with_ansi(false))
         .init();
 
-    let router = Router::new()
-        .route("/", get(|| async { "Mailclerk server" }))
-        .route("/auth", get(routes::auth::handler_auth_gmail))
-        .route(
-            "/auth/callback",
-            get(routes::auth::handler_auth_gmail_callback),
-        )
-        .route(
-            "/auth_token/callback",
-            get(routes::auth::handler_auth_token_callback),
-        )
-        .layer(request_tracing::trace_with_request_id_layer())
-        .layer(CorsLayer::permissive())
-        .layer(CookieManagerLayer::new())
-        .with_state(state.clone())
-        .fallback(handler_404);
-
+    let router = AppRouter::create(state.clone());
     let email_processing_queue = ActiveProcessingQueue::new(state.clone(), 1_000);
     let queue_watch_handle = email_processing_queue.watch().await;
     let processor_cleanup_handle = email_processing_queue_cleanup(email_processing_queue.clone());
