@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::{
     email::client::EmailMessage,
-    model::error::{AppError, AppResult},
+    error::{AppError, AppResult},
     server_config::cfg,
     ServerState,
 };

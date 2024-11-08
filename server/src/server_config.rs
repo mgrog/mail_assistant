@@ -4,7 +4,6 @@ use serde::Deserialize;
 use std::result::Result;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct GmailConfig {
     pub client_id: String,
     pub project_id: String,
@@ -27,7 +26,6 @@ impl GmailConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct Category {
     pub content: String,
     pub mail_label: String,
@@ -36,7 +34,6 @@ pub struct Category {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ModelConfig {
     pub id: String,
     pub temperature: f64,
@@ -51,7 +48,6 @@ pub struct PromptLimits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct TokenLimits {
     pub rate_limit_per_min: usize,
     pub refill_interval_ms: usize,
@@ -61,14 +57,12 @@ pub struct TokenLimits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct Settings {
     pub training_mode: bool,
     pub email_max_age_days: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ApiConfig {
     pub key: String,
     pub prompt_limits: PromptLimits,

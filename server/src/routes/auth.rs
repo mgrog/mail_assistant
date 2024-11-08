@@ -13,13 +13,12 @@ use serde_json::json;
 
 use crate::{
     email::client::EmailClient,
-    model::{
-        error::{AppError, AppJsonResult, AppResult},
-        response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
-    },
+    error::{AppError, AppJsonResult, AppResult},
+    model::response::{GmailApiRefreshTokenResponse, GmailApiTokenResponse},
     server_config::{cfg, GmailConfig},
     HttpClient, ServerState,
 };
+use lib_utils::crypt;
 
 pub async fn handler_auth_gmail(
     State(http_client): State<HttpClient>,
@@ -50,7 +49,6 @@ pub async fn handler_auth_gmail(
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct CallbackQuery {
     pub code: Option<String>,
     pub error: Option<String>,
@@ -77,6 +75,10 @@ pub async fn handler_auth_gmail_callback(
         redirect_uris,
         ..
     } = &cfg.gmail_config;
+
+    // -- DEBUG
+    println!("Gmail config: {:?}", cfg.gmail_config);
+    // -- DEBUG
 
     let resp = state
         .http_client
@@ -117,15 +119,23 @@ pub async fn handler_auth_gmail_callback(
         last_successful_payment_at: ActiveValue::NotSet,
         last_sync: ActiveValue::NotSet,
     })
-    .on_conflict_do_nothing()
+    .on_conflict(
+        OnConflict::column(user::Column::Email)
+            .do_nothing()
+            .to_owned(),
+    )
+    .on_empty_do_nothing()
     .exec(&state.conn)
     .await?;
+
+    let enc_access_code = crypt::encrypt(resp.access_token.as_str())?;
+    let enc_refresh_token = crypt::encrypt(resp.refresh_token.as_str())?;
 
     let account_access = user_account_access::ActiveModel {
         id: ActiveValue::NotSet,
         user_email: ActiveValue::Set(email),
-        access_token: ActiveValue::Set(resp.access_token.clone()),
-        refresh_token: ActiveValue::Set(resp.refresh_token.clone()),
+        access_token: ActiveValue::Set(enc_access_code),
+        refresh_token: ActiveValue::Set(enc_refresh_token),
         expires_at: ActiveValue::Set(DateTime::from(
             chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in as i64),
         )),
@@ -164,7 +174,7 @@ pub async fn handler_auth_token_callback() -> AppJsonResult<serde_json::Value> {
 
 pub async fn exchange_refresh_token(
     http_client: reqwest::Client,
-    refresh_token: String,
+    enc_refresh_token: &str,
 ) -> AppResult<GmailApiRefreshTokenResponse> {
     let GmailConfig {
         token_uri,
@@ -173,12 +183,14 @@ pub async fn exchange_refresh_token(
         ..
     } = &cfg.gmail_config;
 
+    let decrypted = crypt::decrypt(enc_refresh_token)?;
+
     let resp = http_client
         .post(token_uri)
         .form(&[
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token.as_str()),
+            ("refresh_token", decrypted.as_str()),
             ("grant_type", "refresh_token"),
         ])
         .send()

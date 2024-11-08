@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub(crate) struct GmailApiQuota {
     pub drafts_create: usize,
     pub drafts_delete: usize,

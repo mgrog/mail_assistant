@@ -13,7 +13,7 @@ use tokio::time::interval;
 use crate::db_core::queries::{get_user_with_account_access, get_users_with_active_subscriptions};
 use crate::model::daily_email_summary::DailyEmailSentStatus;
 use crate::{
-    model::error::{AppError, AppResult},
+    error::{AppError, AppResult},
     HttpClient, ServerState,
 };
 

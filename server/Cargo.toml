@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+
 [dependencies]
 anyhow = "1.0.86"
 axum = { version = "0.7.5", features = ["macros"] }
@@ -33,10 +34,6 @@ tokenizers = { version = "0.20.0", features = ["http"] }
 lettre = "0.11.9"
 leaky-bucket = "1.1.2"
 minijinja = "2.3.1"
-aws-config = "1.5.8"
-aws-sdk-bedrockruntime = "1.53.0"
-aws-smithy-runtime-api = "1.7.2"
-aws-smithy-types = "1.2.7"
 base64 = "0.22.1"
 html2text = "0.12.6"
 google-cloud-pubsub = "0.29.1"
@@ -47,6 +44,7 @@ chrono-tz = "0.10.0"
 derive_more = { version = "1.0.0", features = ["display"] }
 num-derive = "0.4.2"
 num-traits = "0.2.19"
+lib-utils = { path = "../libs/lib-utils" }
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

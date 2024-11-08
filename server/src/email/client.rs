@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Context};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::future::join_all;
 use google_gmail1::api::{
     Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
@@ -27,7 +27,6 @@ use serde_json::json;
 use crate::{
     api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND},
     model::response::LabelUpdate,
-    routes::auth,
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
 };
 
@@ -58,7 +57,6 @@ pub struct EmailClient {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct EmailMessage {
     pub id: String,
     pub label_ids: Vec<String>,
@@ -92,7 +90,7 @@ impl EmailClient {
     pub async fn new(
         http_client: reqwest::Client,
         conn: DatabaseConnection,
-        user: UserWithAccountAccess,
+        mut user: UserWithAccountAccess,
     ) -> anyhow::Result<EmailClient> {
         let rate_limiter = RateLimiter::builder()
             .initial(GMAIL_QUOTA_PER_SECOND)
@@ -100,25 +98,10 @@ impl EmailClient {
             .refill(GMAIL_QUOTA_PER_SECOND)
             .build();
 
-        let access_token = if user.expires_at < chrono::Utc::now() {
-            let resp = auth::exchange_refresh_token(http_client.clone(), user.refresh_token)
-                .await
-                .map_err(|e| anyhow::anyhow!("Error refreshing token: {:?}", e))?;
-
-            UserAccountAccess::update(user_account_access::ActiveModel {
-                id: ActiveValue::Set(user.user_account_access_id),
-                access_token: ActiveValue::Set(resp.access_token.clone()),
-                expires_at: ActiveValue::Set(DateTime::from(
-                    chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in as i64),
-                )),
-                ..Default::default()
-            })
-            .exec(&conn)
-            .await?;
-            resp.access_token
-        } else {
-            user.access_token
-        };
+        let access_token = user
+            .get_valid_access_code(&conn, http_client.clone())
+            .await
+            .map_err(|e| anyhow!("Could not get new access code: {e}"))?;
 
         let user_configured_settings = get_user_inbox_settings(&conn, user.id)
             .await

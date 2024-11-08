@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context};
+use lib_utils::crypt;
 
 use crate::{
+    error::{AppError, AppResult},
     model::{
-        error::{AppError, AppResult},
         settings_derivatives::{CategoryInboxSetting, CategoryInboxSettingsMap},
         user_derivatives::UserWithAccountAccess,
     },
@@ -15,7 +16,7 @@ pub async fn get_user_with_account_access(
     conn: &DatabaseConnection,
     user_id: i32,
 ) -> AppResult<UserWithAccountAccess> {
-    let user = User::find()
+    let mut user = User::find()
         .filter(user::Column::Id.eq(user_id))
         .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
         .column_as(user_account_access::Column::Id, "user_account_access_id")
@@ -28,6 +29,9 @@ pub async fn get_user_with_account_access(
         .context("Error fetching user with account access")?
         .context("User not found")?;
 
+    user.access_token = crypt::decrypt(&user.access_token)?;
+    user.refresh_token = crypt::decrypt(&user.refresh_token)?;
+
     Ok(user)
 }
 
@@ -35,7 +39,7 @@ pub async fn get_user_with_account_access_by_email(
     conn: &DatabaseConnection,
     user_email: &str,
 ) -> AppResult<UserWithAccountAccess> {
-    let user = User::find()
+    let mut user = User::find()
         .filter(user::Column::Email.eq(user_email))
         .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
         .column_as(user_account_access::Column::Id, "user_account_access_id")
@@ -47,6 +51,9 @@ pub async fn get_user_with_account_access_by_email(
         .await
         .context("Error fetching user with account access")?
         .context("User not found")?;
+
+    user.access_token = crypt::decrypt(&user.access_token)?;
+    user.refresh_token = crypt::decrypt(&user.refresh_token)?;
 
     Ok(user)
 }

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{Duration, Utc};
-use entity::{prelude::*, processed_email, user_account_access};
+use entity::{prelude::*, processed_email};
 use google_gmail1::api::Message;
 use lettre::message::MultiPart;
 use minijinja::render;
@@ -11,7 +11,8 @@ use sea_orm::DatabaseConnection;
 
 use crate::{
     email::{client::EmailClient, email_template::DAILY_SUMMARY_EMAIL_TEMPLATE},
-    model::{error::AppResult, user_derivatives::UserWithAccountAccess},
+    error::AppResult,
+    model::user_derivatives::UserWithAccountAccess,
     HttpClient,
 };
 

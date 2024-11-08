@@ -1,0 +1,15 @@
+[package]
+name = "lib-utils"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.93"
+base64 = "0.22.1"
+simple_crypt = "0.2.3"

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[macro_use]
 mod macros;
 
@@ -5,6 +6,7 @@ mod api_quota;
 mod cron_time_utils;
 mod db_core;
 mod email;
+mod error;
 mod model;
 mod prompt;
 mod rate_limiters;
@@ -52,7 +54,6 @@ struct ServerState {
 }
 
 impl ServerState {
-    #[allow(dead_code)]
     fn add_global_token_count(&self, count: i64) {
         self.token_count.fetch_add(count as u64, Relaxed);
     }
@@ -206,24 +207,24 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Resubscribe to inboxes every 8 hours
-        let state_clone = state.clone();
-        scheduler
-            .add(Job::new_async("0 0 0,8,16 * * *", move |uuid, _l| {
-                let conn = state_clone.conn.clone();
-                let http_client = state_clone.http_client.clone();
-                Box::pin(async move {
-                    println!("Running subscribe to inboxes job {}", uuid);
-                    match email::tasks::subscribe_to_inboxes(conn, http_client).await {
-                        Ok(_) => {
-                            tracing::info!("Subscribe to inboxes job {} succeeded", uuid);
-                        }
-                        Err(e) => {
-                            tracing::error!("Job failed: {:?}", e);
-                        }
-                    }
-                })
-            })?)
-            .await?;
+        // let state_clone = state.clone();
+        // scheduler
+        //     .add(Job::new_async("0 0 0,8,16 * * *", move |uuid, _l| {
+        //         let conn = state_clone.conn.clone();
+        //         let http_client = state_clone.http_client.clone();
+        //         Box::pin(async move {
+        //             println!("Running subscribe to inboxes job {}", uuid);
+        //             match email::tasks::subscribe_to_inboxes(conn, http_client).await {
+        //                 Ok(_) => {
+        //                     tracing::info!("Subscribe to inboxes job {} succeeded", uuid);
+        //                 }
+        //                 Err(e) => {
+        //                     tracing::error!("Job failed: {:?}", e);
+        //                 }
+        //             }
+        //         })
+        //     })?)
+        //     .await?;
     }
 
     scheduler.shutdown_on_ctrl_c();

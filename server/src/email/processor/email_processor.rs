@@ -21,10 +21,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::{
     db_core::queries::get_user_with_account_access_by_email,
     email::client::EmailClient,
-    model::{
-        error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
-        user_derivatives::UserWithAccountAccess,
-    },
+    error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
+    model::user_derivatives::UserWithAccountAccess,
     server_config::{cfg, UNKNOWN_CATEGORY},
     ServerState,
 };
@@ -162,7 +160,6 @@ impl EmailProcessor {
             .unwrap_or_default();
 
         #[derive(FromQueryResult)]
-        #[allow(dead_code)]
         struct ProcessedEmailId {
             id: String,
         }
@@ -469,7 +466,6 @@ impl EmailProcessor {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.cancelled.store(true, Relaxed);
     }
