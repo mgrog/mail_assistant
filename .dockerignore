@@ -5,4 +5,5 @@ Dockerfile
 .git
 .gitignore
 server/config.toml
+server/client_secret.toml
 .env

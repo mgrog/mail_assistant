@@ -138,10 +138,10 @@ async fn main() -> anyhow::Result<()> {
                     let next_tick = l.next_tick_for_job(uuid).await;
                     match next_tick {
                         Ok(Some(ts)) => {
-                            println!("Next time for daily summary mailer job is {:?}", ts)
+                            println!("Next time for email sync job is {:?}", ts)
                         }
                         _ => {
-                            println!("Could not get next tick for daily summary mailer job")
+                            println!("Could not get next tick for email sync job")
                         }
                     }
                 })
@@ -172,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
                 user_setting.user_time_zone_offset
             );
             let cron_time = format!("0 0 {} * * *", user_setting.daily_summary_time);
-            dbg!(&cron_time);
             scheduler
                 .add(
                     Job::new_async_tz(cron_time, offset, move |uuid, mut l| {

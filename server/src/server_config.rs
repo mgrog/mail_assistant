@@ -1,7 +1,7 @@
 use config::{Config, ConfigError};
 use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::result::Result;
+use std::{env, result::Result};
 
 #[derive(Debug, Deserialize)]
 pub struct GmailConfig {
@@ -111,9 +111,17 @@ impl std::fmt::Display for ServerConfig {
 
 lazy_static! {
     pub static ref cfg: ServerConfig = {
-        let root = env!("CARGO_MANIFEST_DIR");
+        let root = env::var("APP_DIR").unwrap_or_else(|_| {
+            env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR or APP_DIR is required")
+        });
         let path = format!("{root}/client_secret.toml");
-        let gmail_config = GmailConfig::from_file(&path).expect("client_secret.toml is required");
+        let mut gmail_config =
+            GmailConfig::from_file(&path).expect("client_secret.toml is required");
+        let redirect_uris = [
+            env::var("GMAIL_REDIRECT_URI_AUTH").unwrap_or(gmail_config.redirect_uris[0].clone()),
+            env::var("GMAIL_REDIRECT_URI_TOKEN").unwrap_or(gmail_config.redirect_uris[1].clone()),
+        ];
+        gmail_config.redirect_uris = redirect_uris.to_vec();
         let path = format!("{root}/config.toml");
         let cfg_file: ConfigFile = Config::builder()
             .add_source(config::File::with_name(&path))

@@ -2,7 +2,8 @@ version: "3.9"
 services:
   mailclerk-server:
     container_name: mailclerk-server
+    platform: linux/amd64
     build:
       context: ../
       dockerfile: ./server/Dockerfile
-    image: mailclerk-server:latest
+    image: mailclerk-server:amd64
