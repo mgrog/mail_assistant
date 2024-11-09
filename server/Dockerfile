@@ -14,8 +14,6 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY . .
-RUN mv server/config.release.toml server/config.toml
-RUN mv server/client_secret.release.toml server/client_secret.toml
 RUN cargo build --release
 
 FROM builder as check
@@ -26,8 +24,8 @@ RUN cargo test --release
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y openssl
 COPY --from=builder /app/target/release/server /usr/local/bin/mailclerk-server
-COPY --from=builder /app/server/config.toml /usr/local/bin/config.toml
-COPY --from=builder /app/server/client_secret.toml /usr/local/bin/client_secret.toml
+COPY --from=builder /app/server/config.release.toml /usr/local/bin/config.toml
+COPY --from=builder /app/server/client_secret.release.toml /usr/local/bin/client_secret.toml
 ENV APP_DIR="/usr/local/bin"
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/mailclerk-server"]
