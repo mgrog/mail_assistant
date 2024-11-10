@@ -37,6 +37,7 @@ impl From<anyhow::Error> for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(error: reqwest::Error) -> Self {
+        tracing::error!("Reqwest error: {:?}", error);
         match error.status() {
             Some(StatusCode::BAD_REQUEST) => AppError::BadRequest(error.to_string()),
             Some(StatusCode::REQUEST_TIMEOUT) => AppError::RequestTimeout,

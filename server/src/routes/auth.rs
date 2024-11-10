@@ -77,7 +77,7 @@ pub async fn handler_auth_gmail_callback(
     } = &cfg.gmail_config;
 
     // -- DEBUG
-    println!("Gmail config: {:?}", cfg.gmail_config);
+    // println!("Gmail config: {:?}", cfg.gmail_config);
     // -- DEBUG
 
     let resp = state
