@@ -19,10 +19,9 @@ use sea_orm::{
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::{
-    db_core::queries::get_user_with_account_access_by_email,
     email::client::EmailClient,
     error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
-    model::user_derivatives::UserWithAccountAccess,
+    model::user::{UserCtrl, UserWithAccountAccess},
     server_config::{cfg, UNKNOWN_CATEGORY},
     ServerState,
 };
@@ -122,7 +121,8 @@ impl EmailProcessor {
         server_state: ServerState,
         email_address: &str,
     ) -> AppResult<Self> {
-        let user = get_user_with_account_access_by_email(&server_state.conn, email_address).await?;
+        let user =
+            UserCtrl::get_with_account_access_by_email(&server_state.conn, email_address).await?;
 
         Self::new(server_state, user).await
     }

@@ -71,6 +71,8 @@ model user_settings {
 model user_token_usage_stats {
   id              Int      @id @default(autoincrement())
   date            DateTime @default(dbgenerated("CURRENT_DATE")) @db.Date
+  month           Int      @default(dbgenerated("EXTRACT(MONTH FROM CURRENT_DATE)"))
+  year            Int      @default(dbgenerated("EXTRACT(YEAR FROM CURRENT_DATE)"))
   tokens_consumed BigInt   @default(0)
   created_at      DateTime @default(now()) @db.Timestamptz(6)
   updated_at      DateTime @default(now()) @db.Timestamptz(6)
@@ -79,6 +81,7 @@ model user_token_usage_stats {
 
   @@unique([date, user_email])
   @@index([date])
+  @@index([user_email])
 }
 
 enum subscription_status {

@@ -10,8 +10,8 @@ use sea_orm::{entity::*, query::*, DatabaseConnection};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use crate::db_core::queries::{get_user_with_account_access, get_users_with_active_subscriptions};
 use crate::model::daily_email_summary::DailyEmailSentStatus;
+use crate::model::user::UserCtrl;
 use crate::{
     error::{AppError, AppResult},
     HttpClient, ServerState,
@@ -68,7 +68,7 @@ pub async fn send_user_daily_email_summary(
     state: &ServerState,
     user_id: i32,
 ) -> AppResult<DailyEmailSentStatus> {
-    let user = get_user_with_account_access(&state.conn, user_id).await?;
+    let user = UserCtrl::get_with_account_access_by_id(&state.conn, user_id).await?;
 
     let is_subscribed = user.subscription_status == SubscriptionStatus::Active;
 
@@ -90,7 +90,7 @@ pub async fn subscribe_to_inboxes(
     conn: DatabaseConnection,
     http_client: HttpClient,
 ) -> AppResult<()> {
-    let active_users = get_users_with_active_subscriptions(&conn).await?;
+    let active_users = UserCtrl::all_with_active_subscriptions(&conn).await?;
     let accounts_to_subscribe = active_users.len();
 
     let mut tasks = active_users

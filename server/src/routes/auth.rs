@@ -1,8 +1,8 @@
 extern crate google_gmail1 as gmail;
 
 use crate::{
-    auth_session_store::AuthSessionStore,
-    db_core::{prelude::*, queries::configure_default_user_settings},
+    auth_session_store::AuthSessionStore, db_core::prelude::*,
+    model::user_settings::UserSettingsCtrl,
 };
 use anyhow::Context;
 use axum::{
@@ -180,7 +180,7 @@ pub async fn handler_auth_gmail_callback(
         .exec_with_returning(&state.conn)
         .await?;
 
-    match configure_default_user_settings(&state, &user_account_access.user_email).await {
+    match UserSettingsCtrl::configure_default(&state, &user_account_access.user_email).await {
         Ok(_) => {}
         Err(AppError::Conflict(_)) => {
             tracing::info!("User settings already exists");
@@ -224,7 +224,13 @@ pub async fn exchange_refresh_token(
         .send()
         .await?;
 
-    let resp = resp.json().await?;
+    let resp = resp.json::<serde_json::Value>().await?;
+    let resp =
+        serde_json::from_value::<GmailApiRefreshTokenResponse>(resp.clone()).map_err(|_| {
+            tracing::error!("Unexpected gmail oauth2 response: {:?}", resp);
+            AppError::Oauth2
+        })?;
+
     Ok(resp)
 }
 

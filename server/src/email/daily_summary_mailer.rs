@@ -12,7 +12,7 @@ use sea_orm::DatabaseConnection;
 use crate::{
     email::{client::EmailClient, email_template::DAILY_SUMMARY_EMAIL_TEMPLATE},
     error::AppResult,
-    model::user_derivatives::UserWithAccountAccess,
+    model::user::UserWithAccountAccess,
     HttpClient,
 };
 

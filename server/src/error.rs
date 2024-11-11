@@ -27,6 +27,7 @@ pub enum AppError {
     // AiPrompt(BedrockConverseError),
     EncryptToken,
     DecryptToken,
+    Oauth2,
 }
 
 impl From<anyhow::Error> for AppError {
@@ -84,7 +85,7 @@ impl IntoResponse for AppError {
                 })),
             ),
             AppError::Internal(e) => {
-                tracing::error!("error msg: {}", e);
+                tracing::error!("Internal error: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": {
@@ -121,7 +122,7 @@ impl IntoResponse for AppError {
                 })),
             ),
             AppError::DbError(err) => {
-                tracing::error!("Error: {:?}", err);
+                tracing::error!("Database error: {:?}", err);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": {
@@ -143,6 +144,15 @@ impl IntoResponse for AppError {
                     "error": {
                         "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                         "message": "Token encryption/decryption error"
+                    }
+                })),
+            ),
+            AppError::Oauth2 => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        "message": "Could not authenticate with OAuth2"
                     }
                 })),
             ),

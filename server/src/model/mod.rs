@@ -1,4 +1,6 @@
 pub mod daily_email_summary;
 pub mod response;
-pub mod settings_derivatives;
-pub mod user_derivatives;
+pub mod user;
+pub mod user_inbox_settings;
+pub mod user_settings;
+pub mod user_token_usage;

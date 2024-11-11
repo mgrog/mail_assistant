@@ -5,10 +5,10 @@ use std::{
 };
 
 use crate::{
-    db_core::{prelude::*, queries::get_user_inbox_settings},
+    db_core::prelude::*,
     model::{
-        settings_derivatives::{default_inbox_settings, CategoryInboxSettingsMap},
-        user_derivatives::UserWithAccountAccess,
+        user::UserWithAccountAccess,
+        user_inbox_settings::{CategoryInboxSettingsMap, UserInboxSettingsCtrl},
     },
 };
 use anyhow::{anyhow, Context};
@@ -103,11 +103,11 @@ impl EmailClient {
             .await
             .map_err(|e| anyhow!("Could not get new access code: {e}"))?;
 
-        let user_configured_settings = get_user_inbox_settings(&conn, user.id)
+        let user_configured_settings = UserInboxSettingsCtrl::get(&conn, user.id)
             .await
             .context("Could not find inbox settings")?;
 
-        let mut category_inbox_settings = default_inbox_settings();
+        let mut category_inbox_settings = UserInboxSettingsCtrl::default();
         category_inbox_settings.extend(user_configured_settings);
 
         // This will be a map from mailclerk:* -> inbox_settings
