@@ -3,7 +3,7 @@ use anyhow::anyhow;
 use chrono::DateTime;
 use lib_utils::crypt;
 
-#[derive(FromQueryResult, Clone)]
+#[derive(FromQueryResult, Clone, Debug)]
 pub struct UserWithAccountAccess {
     pub id: i32,
     pub email: String,
@@ -50,8 +50,9 @@ impl UserWithAccountAccess {
     ) -> anyhow::Result<()> {
         let enc_access_code = crypt::encrypt(refreshed_access_code)
             .map_err(|e| anyhow!("Failed to encrypt access code: {e}"))?;
+
         UserAccountAccess::update(user_account_access::ActiveModel {
-            id: ActiveValue::Set(self.id),
+            id: ActiveValue::Set(self.user_account_access_id),
             access_token: ActiveValue::Set(enc_access_code),
             expires_at: ActiveValue::Set(DateTime::from(
                 chrono::Utc::now() + chrono::Duration::seconds(expires_in),

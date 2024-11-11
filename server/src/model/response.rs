@@ -5,7 +5,7 @@ pub struct GmailApiTokenResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: u64,
-    pub refresh_token: String,
+    pub refresh_token: Option<String>,
     pub scope: String,
 }
 

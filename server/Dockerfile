@@ -1,4 +1,4 @@
-# docker build --build-arg  --tag haze-service:latest .
+# docker build --tag mailclerk-server:latest .
 
 # Leveraging the pre-built Docker images with 
 # cargo-chef and the Rust toolchain
@@ -23,9 +23,10 @@ RUN cargo test --release
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y openssl
-COPY --from=builder /app/target/release/server /usr/local/bin/mailclerk-server
-COPY --from=builder /app/server/config.release.toml /usr/local/bin/config.toml
-COPY --from=builder /app/server/client_secret.release.toml /usr/local/bin/client_secret.toml
-ENV APP_DIR="/usr/local/bin"
+COPY --from=builder /app/target/release/server /app/mailclerk-server
+COPY --from=builder /app/server/config.release.toml /app/config.toml
+COPY --from=builder /app/server/client_secret.release.toml /app/client_secret.toml
+COPY --from=builder /app/cert.pem /app/cert.pem
+ENV APP_DIR=/app
 STOPSIGNAL SIGINT
-ENTRYPOINT ["/usr/local/bin/mailclerk-server"]
+ENTRYPOINT ["/app/mailclerk-server"]

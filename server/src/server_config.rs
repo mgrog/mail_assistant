@@ -1,7 +1,7 @@
 use config::{Config, ConfigError};
 use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::{env, result::Result};
+use std::{env, fs::File, io::Read, result::Result};
 
 #[derive(Debug, Deserialize)]
 pub struct GmailConfig {
@@ -107,6 +107,23 @@ impl std::fmt::Display for ServerConfig {
             self.model
         )
     }
+}
+
+pub fn get_cert() -> Vec<u8> {
+    let path = {
+        if let Ok(dir) = env::var("APP_DIR") {
+            format!("{}/cert.pem", dir)
+        } else {
+            "cert.pem".to_string()
+        }
+    };
+    let mut cert_buf = vec![];
+    File::open(path)
+        .expect("Failed to open cert.pem")
+        .read_to_end(&mut cert_buf)
+        .expect("Failed to read cert.pem");
+
+    cert_buf
 }
 
 lazy_static! {

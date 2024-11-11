@@ -3,6 +3,7 @@
 mod macros;
 
 mod api_quota;
+mod auth_session_store;
 mod cron_time_utils;
 mod db_core;
 mod email;
@@ -22,6 +23,7 @@ use std::{
 };
 
 use anyhow::Context;
+use auth_session_store::AuthSessionStore;
 use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, Router};
 use cron_time_utils::parse_offset_str;
 use db_core::prelude::*;
@@ -31,8 +33,10 @@ use email::{
 use futures::future::join_all;
 use mimalloc::MiMalloc;
 use rate_limiters::RateLimiters;
+use reqwest::Certificate;
 use routes::AppRouter;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
+use server_config::get_cert;
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -51,6 +55,7 @@ struct ServerState {
     conn: DatabaseConnection,
     token_count: TokenCounter,
     rate_limiters: RateLimiters,
+    session_store: AuthSessionStore,
 }
 
 impl ServerState {
@@ -71,11 +76,19 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Database connection failed");
 
+    let cert = get_cert();
+    let http_client = reqwest::ClientBuilder::new()
+        .use_rustls_tls()
+        .add_root_certificate(Certificate::from_pem(&cert)?)
+        .build()?;
+    let session_store = AuthSessionStore::new();
+
     let state = ServerState {
-        http_client: reqwest::Client::new(),
+        http_client,
         conn,
         token_count: Arc::new(AtomicU64::new(0)),
         rate_limiters: RateLimiters::from_env(),
+        session_store,
     };
 
     tracing_subscriber::registry()
@@ -205,25 +218,17 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap();
         }
 
-        // Resubscribe to inboxes every 8 hours
-        // let state_clone = state.clone();
-        // scheduler
-        //     .add(Job::new_async("0 0 0,8,16 * * *", move |uuid, _l| {
-        //         let conn = state_clone.conn.clone();
-        //         let http_client = state_clone.http_client.clone();
-        //         Box::pin(async move {
-        //             println!("Running subscribe to inboxes job {}", uuid);
-        //             match email::tasks::subscribe_to_inboxes(conn, http_client).await {
-        //                 Ok(_) => {
-        //                     tracing::info!("Subscribe to inboxes job {} succeeded", uuid);
-        //                 }
-        //                 Err(e) => {
-        //                     tracing::error!("Job failed: {:?}", e);
-        //                 }
-        //             }
-        //         })
-        //     })?)
-        //     .await?;
+        // Cleanup session storage
+        let state_clone = state.clone();
+        scheduler
+            .add(Job::new_repeated(
+                Duration::from_secs(60),
+                move |_uuid, _lock| {
+                    tracing::info!("Running session storage cleanup job");
+                    state_clone.session_store.clean_store();
+                },
+            )?)
+            .await?;
     }
 
     scheduler.shutdown_on_ctrl_c();
@@ -246,6 +251,9 @@ async fn main() -> anyhow::Result<()> {
     // Handle Ctrl+C
     let shutdown_handle = {
         tokio::spawn(async move {
+            if env::var("NO_SHUTDOWN").unwrap_or("false".to_string()) == "true" {
+                return;
+            }
             signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
             tracing::info!("Received Ctrl+C, shutting down");
             scheduler.shutdown().await.unwrap();
