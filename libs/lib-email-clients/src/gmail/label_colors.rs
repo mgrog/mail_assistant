@@ -123,17 +123,20 @@ pub struct GmailLabelColorMap {
 impl GmailLabelColorMap {
     pub fn new() -> Self {
         let mut reserved = HashMap::new();
-        reserved.insert("uncategorized".to_string(), get_color("white"));
+        reserved.insert("uncategorized".to_string(), get_color("gray-100"));
         reserved.insert("political".to_string(), get_color("purple-400"));
         reserved.insert("ads".to_string(), get_color("yellow-500"));
         reserved.insert("finances".to_string(), get_color("green-800"));
-        reserved.insert("notices".to_string(), get_color("red-500"));
+        reserved.insert("notices".to_string(), get_color("oatmeal"));
         reserved.insert("receipts".to_string(), get_color("blue-200"));
-        reserved.insert("security_alerts".to_string(), get_color("orange"));
+        reserved.insert("security alerts".to_string(), get_color("orange"));
         reserved.insert("newsletters".to_string(), get_color("blue-800"));
         reserved.insert("flights".to_string(), get_color("blue-400"));
-        reserved.insert("orders".to_string(), get_color("teal-800"));
-        reserved.insert("social_media".to_string(), get_color("mint-200"));
+        reserved.insert("orders".to_string(), get_color("blue-green"));
+        reserved.insert("social media".to_string(), get_color("mint-200"));
+        reserved.insert("career networking".to_string(), get_color("straw-500"));
+        reserved.insert("pending archival".to_string(), get_color("rose-600"));
+        reserved.insert("pending deletion".to_string(), get_color("red-600"));
 
         let unreserved = GMAIL_LABEL_COLORS
             .iter()

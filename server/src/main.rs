@@ -264,7 +264,7 @@ fn create_processors_for_users(
     let map = map.clone();
     tracing::info!("Job: {}\n Creating processors for active users...", uuid);
     Box::pin(async move {
-        match email::tasks::add_users_to_processing(state, map).await {
+        match email::tasks::add_users_to_processing(state, map.clone()).await {
             Ok(_) => {
                 tracing::info!("Processor Creation Job {} succeeded", uuid);
             }
@@ -272,6 +272,7 @@ fn create_processors_for_users(
                 tracing::error!("Job failed: {:?}", e);
             }
         }
+        map.cleanup_stopped_processors();
     })
 }
 

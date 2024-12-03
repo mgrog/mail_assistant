@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicI64},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context};
@@ -156,40 +157,34 @@ impl EmailProcessor {
 
     pub async fn run(&self) -> AppResult<()> {
         tracing::info!("Starting email processor for {}", self.email_address);
-        let mut last_run = chrono::DateTime::<Utc>::MIN_UTC;
-        const LOOP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
-        loop {
-            let now = chrono::Utc::now();
-            if std::cmp::max(now - last_run, chrono::Duration::milliseconds(0))
-                < chrono::Duration::from_std(LOOP_DELAY).unwrap()
-            {
-                let delta = (now - last_run).to_std().unwrap_or(LOOP_DELAY);
-                tokio::time::sleep(delta).await;
-                continue;
+        match self.email_client.configure_labels_if_needed().await {
+            Ok(true) => {
+                tracing::info!("Labels configured successfully for {}", self.email_address);
             }
-            last_run = now;
+            Ok(false) => {
+                tracing::info!("Labels already configured for {}", self.email_address);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Error configuring labels for {}: {:?}",
+                    self.email_address,
+                    e
+                );
+                self.fail();
+                return Err(e.into());
+            }
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
 
             if self.is_cancelled() || self.is_quota_reached() {
                 break;
             }
 
-            match self.email_client.configure_labels_if_needed().await {
-                Ok(true) => {
-                    tracing::info!("Labels configured successfully for {}", self.email_address);
-                }
-                Ok(false) => {
-                    tracing::info!("Labels already configured for {}", self.email_address);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Error configuring labels for {}: {:?}",
-                        self.email_address,
-                        e
-                    );
-                    self.fail();
-                    return Err(e.into());
-                }
-            };
+            if self.is_failed() {
+                return Err(anyhow!("Processor failed").into());
+            }
 
             if self
                 .priority_queue
@@ -197,11 +192,15 @@ impl EmailProcessor {
                 == 0
             {
                 match self.queue_recent_emails().await {
-                    Ok(n) if n > 0 => {}
+                    Ok(n) if n > 0 => {
+                        dbg!("Queued recent emails");
+                    }
                     // If there are no recent emails and sufficient quota remaining, queue older emails in low priority
                     Ok(_) if self.current_token_usage() < (*DAILY_QUOTA / 2) => {
                         match self.queue_older_emails().await {
-                            Ok(_) => {}
+                            Ok(_) => {
+                                dbg!("Queued older emails");
+                            }
                             Err(e) => {
                                 tracing::error!(
                                     "Error queuing older emails for {}: {:?}",
@@ -224,6 +223,12 @@ impl EmailProcessor {
                 }
             }
         }
+
+        tracing::info!(
+            "Email processor for {} finished with status: {}",
+            self.email_address,
+            self.status()
+        );
 
         Ok(())
     }
@@ -288,6 +293,7 @@ impl EmailProcessor {
         let mut next_page_token = None;
         while let Ok(resp) = load_page(next_page_token.clone()).await {
             next_page_token = resp.next_page_token.clone();
+            dbg!(&next_page_token);
 
             for id in resp
                 .messages
@@ -338,6 +344,7 @@ impl EmailProcessor {
 
     async fn queue_older_emails(&self) -> AppResult<i32> {
         let new_email_ids = self.fetch_email_ids(None).await?;
+        dbg!(&new_email_ids);
         if new_email_ids.is_empty() {
             return Ok(0);
         }
@@ -441,14 +448,28 @@ impl EmailProcessor {
                 .context("Error inserting email training data")?;
         }
 
-        let label_update = self
+        let label_update = match self
             .email_client
             .label_email(
                 email_id.clone(),
                 current_labels.clone(),
                 email_category.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(label_update) => label_update,
+            Err(e) => {
+                tracing::error!("Error labeling email {}: {:?}", email_id, e);
+                match self.email_client.configure_labels_if_needed().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Could not fix labels for {}: {:?}", self.email_address, e);
+                        self.fail();
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         match ProcessedEmailCtrl::insert(
             &self.conn,
@@ -495,8 +516,8 @@ impl EmailProcessor {
     }
 
     pub async fn process_email(&self, id: u128, priority: Priority) {
-        if self.is_cancelled() || self.is_quota_reached() {
-            // Do not process email if processor is cancelled or quota is reached
+        if self.is_cancelled() || self.is_quota_reached() || self.is_failed() {
+            // Do not process email if processor is failed, cancelled or quota is reached
             return;
         }
 
@@ -622,6 +643,10 @@ impl EmailProcessor {
         self.cancelled.load(Relaxed)
     }
 
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Relaxed)
+    }
+
     pub fn emails_remaining(&self) -> i64 {
         self.priority_queue.num_in_queue(&self.email_address) as i64
     }
@@ -630,7 +655,7 @@ impl EmailProcessor {
         match true {
             _ if self.is_cancelled() => ProcessorStatus::Cancelled,
             _ if self.is_quota_reached() => ProcessorStatus::QuotaExceeded,
-            _ if self.failed.load(Relaxed) => ProcessorStatus::Failed,
+            _ if self.is_failed() => ProcessorStatus::Failed,
             _ if self
                 .priority_queue
                 .num_high_priority_in_queue(&self.email_address)

@@ -26,7 +26,7 @@ impl GmailConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Category {
     pub content: String,
     pub mail_label: String,

@@ -116,10 +116,14 @@ impl UserCtrl {
         let today = chrono::Utc::now().date_naive();
         let users = User::find()
             .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-            .filter(user_token_usage_stats::Column::TokensConsumed.lt(daily_quota as i64))
+            .filter(
+                Condition::any()
+                    .add(user_token_usage_stats::Column::TokensConsumed.lt(daily_quota as i64))
+                    .add(user_token_usage_stats::Column::TokensConsumed.is_null()),
+            )
             .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
             .join(
-                JoinType::InnerJoin,
+                JoinType::LeftJoin,
                 user::Relation::UserTokenUsageStats
                     .def()
                     .on_condition(move |_left, right| {
@@ -134,7 +138,7 @@ impl UserCtrl {
             .column_as(user_account_access::Column::RefreshToken, "refresh_token")
             .column_as(user_account_access::Column::ExpiresAt, "expires_at")
             .column_as(
-                user_token_usage_stats::Column::TokensConsumed,
+                Expr::col(user_token_usage_stats::Column::TokensConsumed).if_null(0),
                 "tokens_consumed",
             )
             .into_model::<UserWithAccountAccessAndUsage>()

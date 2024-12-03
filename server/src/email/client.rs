@@ -178,35 +178,11 @@ impl EmailClient {
             .acquire(GMAIL_API_QUOTA.messages_list)
             .await;
 
-        // Add mailclerk labels to filter
-        let mut label_set = cfg
-            .categories
-            .iter()
-            .map(|c| format!("label:{}", c.mail_label))
-            .collect::<HashSet<_>>();
-
-        // Add special labels to filter
-        for mail_label in &[
-            UNKNOWN_CATEGORY.mail_label.clone(),
-            DAILY_SUMMARY_CATEGORY.mail_label.clone(),
-        ] {
-            label_set.insert(format!("label:{}", mail_label));
-        }
-
-        let labels = vec!["label:inbox".to_string()]
-            .into_iter()
-            .chain(label_set)
-            .collect::<Vec<_>>();
-
-        let labels_filter = labels.join(" AND NOT ");
-
         let time_filter = options
             .more_recent_than
             .map(|duration| format!("after:{}", (Utc::now() - duration).timestamp()));
 
-        // -- DEBUG
-        // println!("Filter: {}", labels_filter);
-        // -- DEBUG
+        let labels_filter = build_mailclerk_label_filter();
 
         let mut filters = vec![labels_filter];
         if let Some(time_filter) = time_filter {
@@ -700,13 +676,44 @@ fn get_required_labels() -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
+fn format_filter(label: &str) -> String {
+    let label = label.replace(" ", "-");
+    format!("label:Mailclerk/{}", label)
+}
+
+fn build_mailclerk_label_filter() -> String {
+    // Add mailclerk labels to filter
+    let label_set = cfg
+        .categories
+        .iter()
+        .map(|c| c.mail_label.as_str())
+        .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
+        .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
+        .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
+        .map(format_filter)
+        .collect::<HashSet<String>>();
+
+    let labels = vec!["label:inbox".to_string()]
+        .into_iter()
+        .chain(label_set)
+        .collect::<Vec<_>>();
+
+    labels.join(" AND NOT ")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use indexmap::Equivalent;
+    use std::collections::HashSet;
+    use strum::IntoEnumIterator;
 
     use google_gmail1::api::Label;
 
-    use crate::email::client::get_required_labels;
+    use crate::{
+        email::client::{format_filter, get_required_labels},
+        model::labels,
+        server_config::cfg,
+    };
 
     #[test]
     fn test_gmail_url() {
@@ -813,9 +820,37 @@ mod tests {
 
     #[test]
     fn test_get_required_labels() {
-        dotenvy::dotenv().ok();
+        dotenvy::from_filename(".env.integration").unwrap();
         let required_labels = get_required_labels();
         dbg!(&required_labels);
         assert_eq!(true, false)
+    }
+
+    #[test]
+    fn test_build_mailclerk_label_filter() {
+        dotenvy::from_filename(".env.integration").unwrap();
+        let filter = super::build_mailclerk_label_filter();
+
+        let expected = &cfg
+            .categories
+            .iter()
+            .map(|c| c.mail_label.as_str())
+            .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
+            .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
+            .chain(std::iter::once(&*super::UNKNOWN_CATEGORY.mail_label))
+            .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
+            .map(format_filter)
+            .chain(std::iter::once("label:inbox".to_string()))
+            .collect::<HashSet<_>>();
+
+        let actual = filter
+            .split(" AND NOT ")
+            .map(|x| x.to_string())
+            .collect::<HashSet<_>>();
+
+        dbg!(&expected, "len: ", expected.len());
+        dbg!(&actual, "len: ", actual.len());
+
+        assert!(expected.is_subset(&actual) && actual.is_subset(expected));
     }
 }

@@ -36,7 +36,24 @@ impl ActiveEmailProcessorMap {
         let user_email = user.email.clone();
 
         if let Some(processor) = self.active_processors.read().unwrap().get(&user_email) {
-            return Ok(processor.clone());
+            match processor.status() {
+                ProcessorStatus::Cancelled
+                | ProcessorStatus::Failed
+                | ProcessorStatus::QuotaExceeded => {
+                    tracing::info!("Recreating processor for {}", user_email);
+                }
+                _ if processor.current_token_usage() != user.tokens_consumed => {
+                    tracing::info!(
+                        "Token usage has changed, recreating processor for {}",
+                        user_email
+                    );
+                    processor.cancel();
+                }
+                _ => {
+                    tracing::info!("Processor for {} already exists", user_email);
+                    return Ok(processor.clone());
+                }
+            };
         }
 
         let proc = Arc::new(
@@ -60,16 +77,14 @@ impl ActiveEmailProcessorMap {
             });
         }
 
-        let result = self
-            .active_processors
+        self.active_processors
             .write()
             .unwrap()
-            .insert(user_email, proc)
-            .context("Could not insert processor");
+            .insert(user_email, proc.clone());
 
         self.get_current_state();
 
-        result
+        Ok(proc)
     }
 
     pub fn get_current_state(&self) -> Option<String> {

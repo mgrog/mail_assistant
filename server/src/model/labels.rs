@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
+use crate::server_config::Category;
+
 #[derive(Debug, Clone, Copy, EnumIter, Serialize, Deserialize)]
 pub enum CleanupLabels {
     PendingDeletion,

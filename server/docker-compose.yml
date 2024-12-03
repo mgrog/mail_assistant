@@ -7,3 +7,10 @@ services:
       context: ../
       dockerfile: ./server/Dockerfile
     image: mailclerk-server:amd64
+  mailclerk-server-macos:
+    container_name: mailclerk-server
+    platform: linux/arm64
+    build:
+      context: ../
+      dockerfile: ./server/Dockerfile
+    image: mailclerk-server:arm64
