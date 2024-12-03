@@ -1,3 +1,4 @@
+use lib_email_clients::gmail;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,4 +41,32 @@ pub struct GmailError {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GmailErrorResponse {
     pub error: GmailError,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum GmailAccountConnectionStatus {
+    Good,
+    MissingScopes {
+        missing_scopes: Vec<gmail::AccessScopes>,
+    },
+    NotConnected,
+    FailedChecks {
+        failed_checks: Vec<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckAccountConnectionResponse {
+    pub email: String,
+    pub result: GmailAccountConnectionStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GoogleTokenInfo {
+    pub issued_to: String,
+    pub audience: String,
+    pub scope: String,
+    pub expires_in: i64,
+    pub access_type: String,
 }

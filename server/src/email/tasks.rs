@@ -1,67 +1,50 @@
 use std::time::Duration;
-use std::vec;
 
-use anyhow::anyhow;
 use entity::sea_orm_active_enums::SubscriptionStatus;
-use entity::{prelude::*, user};
 use futures::future::join_all;
-use futures::FutureExt;
-use sea_orm::{entity::*, query::*, DatabaseConnection};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::model::daily_email_summary::DailyEmailSentStatus;
 use crate::model::user::UserCtrl;
-use crate::{
-    error::{AppError, AppResult},
-    HttpClient, ServerState,
-};
+use crate::prompt::priority_queue::PromptPriorityQueue;
+use crate::{error::AppResult, ServerState};
 
-use super::active_email_processors::ActiveProcessingQueue;
-use super::client::EmailClient;
+use super::active_email_processors::ActiveEmailProcessorMap;
 use super::daily_summary_mailer::DailySummaryMailer;
 
-pub async fn process_unsynced_user_emails(
+pub async fn add_users_to_processing(
     state: ServerState,
-    queue: ActiveProcessingQueue,
+    email_processor_map: ActiveEmailProcessorMap,
 ) -> AppResult<()> {
     let conn = &state.conn;
-    let user_accounts: Vec<_> = User::find()
-        .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-        .find_also_related(UserAccountAccess)
-        .all(conn)
-        .await?
-        .into_iter()
-        .filter_map(|(_, account_access)| account_access)
-        .collect();
+    let user_accounts = UserCtrl::all_with_available_quota(conn).await?;
+    tracing::info!("Adding {} users to processing", user_accounts.len());
 
-    let tasks = user_accounts
-        .into_iter()
-        .map(|access| queue.add_to_processing(access.user_email.clone()))
-        .collect::<Vec<_>>();
-
-    let mut successes = vec![];
-    let mut errors = vec![];
-    for result in join_all(tasks).await {
-        match result {
-            Ok(email) => {
-                successes.push(email);
-            }
+    for user in user_accounts {
+        match email_processor_map.insert_processor(user).await {
+            Ok(_) => {}
             Err(err) => {
-                tracing::error!("Error processing emails: {:?}", err);
-                errors.push(err);
+                tracing::error!("Error adding user to processing: {:?}", err);
             }
         }
     }
 
-    if !errors.is_empty() {
-        Err(AppError::Internal(anyhow!(
-            "Task failed to sync some emails: {:?}",
-            errors
-        )))
-    } else {
-        Ok(())
+    Ok(())
+}
+
+pub async fn sweep_for_cancelled_subscriptions(
+    state: &ServerState,
+    email_processor_map: ActiveEmailProcessorMap,
+) -> AppResult<()> {
+    let conn = &state.conn;
+    let user_accounts = UserCtrl::all_with_cancelled_subscriptions(conn).await?;
+
+    for user in user_accounts {
+        email_processor_map.cancel_processor(&user.email);
     }
+
+    Ok(())
 }
 
 pub async fn send_user_daily_email_summary(
@@ -86,68 +69,53 @@ pub async fn send_user_daily_email_summary(
     Ok(DailyEmailSentStatus::Sent)
 }
 
-pub async fn subscribe_to_inboxes(
-    conn: DatabaseConnection,
-    http_client: HttpClient,
-) -> AppResult<()> {
-    let active_users = UserCtrl::all_with_active_subscriptions(&conn).await?;
-    let accounts_to_subscribe = active_users.len();
-
-    let mut tasks = active_users
-        .into_iter()
-        .map(|user| {
-            let http_client = http_client.clone();
-            let conn = conn.clone();
-            async move {
-                let email = user.email.clone();
-                let client = EmailClient::new(http_client, conn, user).await?;
-                let result = client.watch_mailbox().await?;
-
-                Ok::<_, AppError>((email, result))
-            }
-            .boxed()
-        })
-        .collect::<Vec<_>>();
-
-    if tasks.is_empty() {
-        return Err(anyhow!("No active user sessions found").into());
-    }
-
-    let mut accounts_subscribed = 0;
-    const CHUNK_SIZE: usize = 10;
-    for chunk in tasks.chunks_mut(CHUNK_SIZE) {
-        for result in join_all(chunk).await {
-            match result {
-                Ok((email, result)) => {
-                    accounts_subscribed += 1;
-                    tracing::info!("Watch message result: {:?}", result);
-                    tracing::info!("Successfully subscribed to inbox for {}", email);
-                }
-                Err(err) => {
-                    tracing::error!("Error subscribing to inbox: {:?}", err);
-                }
-            }
-        }
-        tracing::info!(
-            "Subscribed to {}/{} accounts",
-            accounts_subscribed,
-            accounts_to_subscribe
-        );
-    }
-
-    Ok(())
-}
-
-pub fn email_processing_queue_cleanup(queue: ActiveProcessingQueue) -> JoinHandle<()> {
+pub fn email_processing_map_cleanup(map: ActiveEmailProcessorMap) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(5));
+        let mut interval = interval(Duration::from_secs(30));
 
         loop {
             // -- DEBUG
-            // tracing::info!("Starting email processing queue cleanup task");
+            // tracing::info!("Starting email processing map cleanup task");
             // -- DEBUG
             interval.tick().await;
-            queue.cleanup_finished_processors().await;
+            map.cleanup_stopped_processors();
+        }
+    })
+}
+
+/// This function pulls emails from the prompt priority queue and sends them to the
+/// appropriate email processor for processing.
+pub fn run_email_processing_loop(
+    prompt_priority_queue: PromptPriorityQueue,
+    email_processor_map: ActiveEmailProcessorMap,
+) -> JoinHandle<()> {
+    tracing::info!("Starting email processing loop...");
+    let handles = (0..10).map(move |_| {
+        let prompt_priority_queue = prompt_priority_queue.clone();
+        let email_processor_map = email_processor_map.clone();
+        tokio::spawn(async move {
+            loop {
+                let entry = prompt_priority_queue.pop();
+                if let Some(entry) = entry {
+                    let email = &entry.user_email;
+                    let email_id = entry.email_id;
+                    if let Some(processor) = email_processor_map.get(email) {
+                        processor.process_email(email_id, entry.priority).await;
+                        prompt_priority_queue.remove_from_processing(email_id);
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+    });
+
+    tokio::task::spawn(async move {
+        for result in join_all(handles).await {
+            if let Err(err) = result {
+                tracing::error!("Email processing loop error: {:?}", err);
+                panic!("Email processing loop panicked!");
+            }
         }
     })
 }

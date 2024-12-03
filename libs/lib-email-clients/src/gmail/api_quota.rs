@@ -1,4 +1,4 @@
-pub(crate) struct GmailApiQuota {
+pub struct GmailApiQuota {
     pub drafts_create: usize,
     pub drafts_delete: usize,
     pub drafts_get: usize,
@@ -59,9 +59,9 @@ pub(crate) struct GmailApiQuota {
     pub watch: usize,
 }
 
-pub(crate) const GMAIL_QUOTA_PER_SECOND: usize = 250;
+pub const GMAIL_QUOTA_PER_SECOND: usize = 250;
 
-pub(crate) const GMAIL_API_QUOTA: GmailApiQuota = GmailApiQuota {
+pub const GMAIL_API_QUOTA: GmailApiQuota = GmailApiQuota {
     drafts_create: 10,
     drafts_delete: 10,
     drafts_get: 5,

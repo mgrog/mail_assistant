@@ -20,23 +20,21 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::inbox_settings::Entity")]
-    InboxSettings,
+    #[sea_orm(has_many = "super::cleanup_settings::Entity")]
+    CleanupSettings,
     #[sea_orm(has_many = "super::processed_daily_summary::Entity")]
     ProcessedDailySummary,
     #[sea_orm(has_many = "super::processed_email::Entity")]
     ProcessedEmail,
     #[sea_orm(has_one = "super::user_account_access::Entity")]
     UserAccountAccess,
-    #[sea_orm(has_one = "super::user_settings::Entity")]
-    UserSettings,
-    #[sea_orm(has_one = "super::user_token_usage_stats::Entity")]
+    #[sea_orm(has_many = "super::user_token_usage_stats::Entity")]
     UserTokenUsageStats,
 }
 
-impl Related<super::inbox_settings::Entity> for Entity {
+impl Related<super::cleanup_settings::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::InboxSettings.def()
+        Relation::CleanupSettings.def()
     }
 }
 
@@ -55,12 +53,6 @@ impl Related<super::processed_email::Entity> for Entity {
 impl Related<super::user_account_access::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::UserAccountAccess.def()
-    }
-}
-
-impl Related<super::user_settings::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::UserSettings.def()
     }
 }
 

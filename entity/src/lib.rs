@@ -2,12 +2,11 @@
 
 pub mod prelude;
 
+pub mod cleanup_settings;
 pub mod email_training;
-pub mod inbox_settings;
 pub mod processed_daily_summary;
 pub mod processed_email;
 pub mod sea_orm_active_enums;
 pub mod user;
 pub mod user_account_access;
-pub mod user_settings;
 pub mod user_token_usage_stats;

@@ -1,10 +1,9 @@
 extern crate google_gmail1 as gmail;
 
 use crate::{
-    auth_session_store::AuthSessionStore, db_core::prelude::*,
-    model::user_settings::UserSettingsCtrl,
+    auth::{jwt::generate_redirect_auth_headers, session_store::AuthSessionStore},
+    db_core::prelude::*,
 };
-use anyhow::Context;
 use axum::{
     extract::{Query, State},
     response::{IntoResponse, Redirect},
@@ -12,6 +11,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use entity::user_account_access::Column::*;
+use sea_orm::TryInsertResult;
 use serde::Deserialize;
 use serde_json::json;
 use url::Url;
@@ -24,6 +24,8 @@ use crate::{
     HttpClient, ServerState,
 };
 use lib_utils::crypt;
+
+const CONFIRM_CONNECTION_PATH: &str = "confirm-connection";
 
 fn _get_auth_uri(session_store: &AuthSessionStore) -> String {
     let GmailConfig {
@@ -54,12 +56,10 @@ fn _get_auth_uri(session_store: &AuthSessionStore) -> String {
 pub async fn handler_auth_gmail(
     State(http_client): State<HttpClient>,
     State(session_store): State<AuthSessionStore>,
-) -> AppJsonResult<serde_json::Value> {
+) -> AppResult<impl IntoResponse> {
     let req = http_client.get(_get_auth_uri(&session_store)).build()?;
 
-    Ok(Json(json!({
-        "url": req.url().to_string()
-    })))
+    Ok(Redirect::to(req.url().as_str()))
 }
 
 #[derive(Deserialize, Debug)]
@@ -73,9 +73,10 @@ pub struct CallbackQuery {
 pub async fn handler_auth_gmail_callback(
     State(state): State<ServerState>,
     Query(query): Query<CallbackQuery>,
-) -> AppResult<impl IntoResponse> {
-    if let Some(error) = query.error {
-        return Err(AppError::Unauthorized(error));
+) -> Result<impl IntoResponse, AuthCallbackError> {
+    if query.error.is_some() {
+        tracing::error!("Error in oauth2 callback: {:?}", query.error);
+        return Err(AuthCallbackError::Unexpected);
     }
     let GmailConfig {
         token_uri,
@@ -106,12 +107,16 @@ pub async fn handler_auth_gmail_callback(
             ("grant_type", "authorization_code"),
         ])
         .send()
-        .await?;
+        .await
+        .map_err(|_| AuthCallbackError::Unexpected)?;
 
-    let resp: serde_json::Value = resp.json().await?;
+    let resp: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| AuthCallbackError::BadOauthResponse)?;
     let resp: GmailApiTokenResponse = serde_json::from_value(resp.clone()).map_err(|_| {
         tracing::error!("Failed to parse response: {:?}", resp);
-        AppError::BadRequest("Failed to parse google oauth response".to_string())
+        AuthCallbackError::BadOauthResponse
     })?;
 
     match state.session_store.load_session(auth_state) {
@@ -119,19 +124,22 @@ pub async fn handler_auth_gmail_callback(
             state.session_store.destroy_session(auth_state);
         }
         _ => {
-            return Err(AppError::Unauthorized("Invalid state".to_string()));
+            return Err(AuthCallbackError::InvalidState);
         }
     }
 
     let email_client =
         EmailClient::from_access_code(state.http_client.clone(), resp.access_token.clone());
-    let profile = email_client.get_profile().await?;
+    let profile = email_client
+        .get_profile()
+        .await
+        .map_err(|_| AuthCallbackError::Unexpected)?;
     // -- DEBUG
     // println!("Profile: {:?}", profile);
     // -- DEBUG
     let email = profile
         .email_address
-        .context("Profile email not found. An email address is required")?;
+        .ok_or(AuthCallbackError::NoEmailAddress)?;
 
     User::insert(user::ActiveModel {
         id: ActiveValue::NotSet,
@@ -150,15 +158,20 @@ pub async fn handler_auth_gmail_callback(
     )
     .on_empty_do_nothing()
     .exec(&state.conn)
-    .await?;
+    .await
+    .map_err(|e| {
+        tracing::error!("Error inserting user: {:?}", e);
+        AuthCallbackError::Unexpected
+    })?;
 
-    let enc_access_code = crypt::encrypt(resp.access_token.as_str())?;
+    let enc_access_code =
+        crypt::encrypt(resp.access_token.as_str()).map_err(|_| AuthCallbackError::Unexpected)?;
 
     let mut account_access = user_account_access::ActiveModel {
         id: ActiveValue::NotSet,
-        user_email: ActiveValue::Set(email),
+        user_email: ActiveValue::Set(email.clone()),
         access_token: ActiveValue::Set(enc_access_code),
-        refresh_token: ActiveValue::NotSet,
+        refresh_token: ActiveValue::Set("TEMP".to_string()),
         expires_at: ActiveValue::Set(DateTime::from(
             chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in as i64),
         )),
@@ -166,34 +179,53 @@ pub async fn handler_auth_gmail_callback(
         updated_at: ActiveValue::NotSet,
     };
 
+    let has_refresh_token = resp.refresh_token.is_some();
     if let Some(refresh_token) = resp.refresh_token {
         let enc_refresh_token = crypt::encrypt(refresh_token.as_str()).unwrap();
         account_access.refresh_token = ActiveValue::Set(enc_refresh_token);
     };
 
-    let user_account_access = UserAccountAccess::insert(account_access)
+    let user_account_access_insert_result = UserAccountAccess::insert(account_access)
         .on_conflict(
             OnConflict::column(UserEmail)
-                .update_columns([AccessToken, RefreshToken, ExpiresAt, UpdatedAt])
+                .update_columns(if has_refresh_token {
+                    vec![AccessToken, RefreshToken, ExpiresAt, UpdatedAt]
+                } else {
+                    vec![AccessToken, ExpiresAt, UpdatedAt]
+                })
                 .to_owned(),
         )
-        .exec_with_returning(&state.conn)
-        .await?;
+        .do_nothing()
+        .exec(&state.conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("Error inserting user account access: {:?}", e);
+            AuthCallbackError::Unexpected
+        })?;
 
-    match UserSettingsCtrl::configure_default(&state, &user_account_access.user_email).await {
-        Ok(_) => {}
-        Err(AppError::Conflict(_)) => {
-            tracing::info!("User settings already exists");
+    let mut url = cfg.frontend_url.clone();
+    match user_account_access_insert_result {
+        TryInsertResult::Inserted(_) | TryInsertResult::Conflicted => {
+            let headers =
+                generate_redirect_auth_headers().map_err(|_| AuthCallbackError::Unexpected)?;
+            url.path_segments_mut()
+                .unwrap()
+                .push(CONFIRM_CONNECTION_PATH);
+            return Ok((headers, Redirect::to(url.as_str())).into_response());
         }
-        Err(e) => {
-            return Err(e);
+        // Need to handle this case by logging user in with google oauth2 jwt
+        // TryInsertResult::Conflicted(_) => {
+        // let headers = generate_headers_with_cookie(LONG_TTL, &email)
+        //     .map_err(|_| AuthCallbackError::Unexpected)?;
+        // let url = cfg.frontend_url.clone();
+        // url.join("/dashboard").expect("Frontend url is invalid!");
+        // return Ok((headers, Redirect::to(url.as_str())).into_response());
+        // }
+        _ => {
+            tracing::error!("Unexpected result from user account access insert");
+            Err(AuthCallbackError::Unexpected)
         }
     }
-
-    Ok(Json(json!({
-        "message": "Login success",
-    }))
-    .into_response())
 }
 
 pub async fn handler_auth_token_callback() -> AppJsonResult<serde_json::Value> {
@@ -203,7 +235,7 @@ pub async fn handler_auth_token_callback() -> AppJsonResult<serde_json::Value> {
 }
 
 pub async fn exchange_refresh_token(
-    http_client: reqwest::Client,
+    http_client: &HttpClient,
     refresh_token: &str,
 ) -> AppResult<GmailApiRefreshTokenResponse> {
     let GmailConfig {
@@ -225,6 +257,12 @@ pub async fn exchange_refresh_token(
         .await?;
 
     let resp = resp.json::<serde_json::Value>().await?;
+
+    if resp.get("error").is_some() {
+        tracing::error!("Error refreshing token: {:?}", resp);
+        return Err(AppError::Oauth2);
+    }
+
     let resp =
         serde_json::from_value::<GmailApiRefreshTokenResponse>(resp.clone()).map_err(|_| {
             tracing::error!("Unexpected gmail oauth2 response: {:?}", resp);
@@ -232,6 +270,39 @@ pub async fn exchange_refresh_token(
         })?;
 
     Ok(resp)
+}
+
+pub(crate) enum AuthCallbackError {
+    InvalidState,
+    Unexpected,
+    BadOauthResponse,
+    NoEmailAddress,
+}
+
+impl IntoResponse for AuthCallbackError {
+    fn into_response(self) -> axum::response::Response {
+        let mut url = cfg.frontend_url.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .push(CONFIRM_CONNECTION_PATH);
+
+        let headers = generate_redirect_auth_headers().unwrap();
+
+        match self {
+            AuthCallbackError::InvalidState => {
+                url.query_pairs_mut().append_pair("error", "state_mismatch");
+                (headers, Redirect::to(url.as_str())).into_response()
+            }
+            AuthCallbackError::NoEmailAddress => {
+                url.query_pairs_mut().append_pair("error", "no_email");
+                (headers, Redirect::to(url.as_str())).into_response()
+            }
+            _ => {
+                url.query_pairs_mut().append_pair("error", "unexpected");
+                (headers, Redirect::to(url.as_str())).into_response()
+            }
+        }
+    }
 }
 
 // struct AuthRedirect;

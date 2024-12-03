@@ -7,11 +7,12 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::rate_limiters;
+use crate::HttpClient;
 use crate::{
     email::client::EmailMessage,
     error::{AppError, AppResult},
     server_config::cfg,
-    ServerState,
 };
 
 lazy_static! {
@@ -32,10 +33,10 @@ fn get_ai_categories() -> Vec<String> {
 }
 
 pub async fn send_category_prompt(
-    server_state: &ServerState,
+    http_client: &HttpClient,
+    rate_limiters: &rate_limiters::RateLimiters,
     email_message: &EmailMessage,
 ) -> AppResult<CategoryPromptResponse> {
-    let http_client = &server_state.http_client;
     let subject = email_message.subject.as_ref().map_or("", |s| s.as_str());
     let body = email_message.body.as_ref().map_or("", |s| s.as_str());
     let email_content_str = format!("<subject>{}</subject>\n<body>{}</body>", subject, body);
@@ -86,7 +87,7 @@ pub async fn send_category_prompt(
     let parsed = match parsed {
         ChatApiResponseOrError::Error(error) => {
             if error.message == "Requests rate limit exceeded" {
-                server_state.rate_limiters.trigger_backoff();
+                rate_limiters.trigger_backoff();
             }
             return Err(anyhow!("Chat API error: {:?}", error).into());
         }

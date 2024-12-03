@@ -16,17 +16,17 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
-FROM builder as check
+FROM builder AS check
 RUN rustup component add clippy rustfmt
 RUN cargo clippy --all-targets --all-features
 RUN cargo test --release
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y openssl
+FROM alpine:3 AS runtime
+RUN apk update && apk add openssl
 COPY --from=builder /app/target/release/server /app/mailclerk-server
 COPY --from=builder /app/server/config.release.toml /app/config.toml
 COPY --from=builder /app/server/client_secret.release.toml /app/client_secret.toml
-COPY --from=builder /app/cert.pem /app/cert.pem
+COPY --from=builder /app/server/cert.pem /app/cert.pem
 ENV APP_DIR=/app
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/app/mailclerk-server"]

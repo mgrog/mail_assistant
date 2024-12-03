@@ -2,6 +2,7 @@ use config::{Config, ConfigError};
 use lazy_static::lazy_static;
 use serde::Deserialize;
 use std::{env, fs::File, io::Read, result::Result};
+use url::Url;
 
 #[derive(Debug, Deserialize)]
 pub struct GmailConfig {
@@ -86,13 +87,14 @@ pub struct ServerConfig {
     pub heuristics: Vec<Category>,
     pub gmail_config: GmailConfig,
     pub model: ModelConfig,
+    pub frontend_url: Url,
 }
 
 impl std::fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Server Config:\n{:?}\n\nAPI: {:?}\n\nCategories:\n{}\n\nHeuristics:\n{}\n\nGmail Config: {:?}\n\nModel Config: {:?}\n\n",
+            "Server Config:\n{:?}\n\nAPI: {:?}\n\nCategories:\n{}\n\nHeuristics:\n{}\n\nGmail Config: {:?}\n\nModel Config: {:?}\n\nFrontend URL: {:?}",
             self.settings,
             self.api,
             self.categories
@@ -104,7 +106,8 @@ impl std::fmt::Display for ServerConfig {
                 .map(|c| format!("{} -> {}", c.content, c.mail_label))
                 .collect::<Vec<_>>().join("\n"),
             self.gmail_config,
-            self.model
+            self.model,
+            self.frontend_url.as_str(),
         )
     }
 }
@@ -114,9 +117,10 @@ pub fn get_cert() -> Vec<u8> {
         if let Ok(dir) = env::var("APP_DIR") {
             format!("{}/cert.pem", dir)
         } else {
-            "cert.pem".to_string()
+            "server/cert.pem".to_string()
         }
     };
+
     let mut cert_buf = vec![];
     File::open(path)
         .expect("Failed to open cert.pem")
@@ -155,6 +159,9 @@ lazy_static! {
             heuristics,
         } = cfg_file;
 
+        let frontend_url = Url::parse(&env::var("FRONTEND_URL").expect("FRONTEND_URL is required"))
+            .expect("FRONTEND_URL is invalid");
+
         ServerConfig {
             settings,
             api,
@@ -162,17 +169,18 @@ lazy_static! {
             heuristics,
             gmail_config,
             model,
+            frontend_url,
         }
     };
     pub static ref UNKNOWN_CATEGORY: Category = Category {
         content: "Unknown".to_string(),
-        mail_label: "mailclerk:uncategorized".to_string(),
+        mail_label: "uncategorized".to_string(),
         gmail_categories: vec![],
         important: None,
     };
     pub static ref DAILY_SUMMARY_CATEGORY: Category = Category {
         content: "".to_string(),
-        mail_label: "mailclerk:daily_summary".to_string(),
+        mail_label: "daily_summary".to_string(),
         gmail_categories: vec![],
         important: None,
     };

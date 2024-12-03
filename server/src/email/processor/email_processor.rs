@@ -6,14 +6,16 @@ use std::{
     },
 };
 
-use super::queue::{EmailProcessingQueue, EmailQueueStatus};
 use anyhow::{anyhow, Context};
+use chrono::Utc;
 use derive_more::Display;
-use entity::{email_training, prelude::*, processed_email, user, user_token_usage_stats};
-use futures::future::join_all;
+use entity::{
+    email_training, prelude::*, processed_email, sea_orm_active_enums::CleanupAction, user,
+};
+use indexmap::IndexSet;
 use num_traits::FromPrimitive;
 use sea_orm::{
-    entity::*, prelude::Expr, query::*, sea_query::OnConflict, ActiveValue, EntityTrait,
+    entity::*, query::*, sea_query::OnConflict, ActiveValue, DatabaseConnection, EntityTrait,
     FromQueryResult,
 };
 use std::sync::atomic::Ordering::Relaxed;
@@ -21,31 +23,56 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::{
     email::client::EmailClient,
     error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
-    model::user::{UserCtrl, UserWithAccountAccess},
+    model::{
+        cleanup_settings::CleanupSettingsCtrl,
+        processed_email::ProcessedEmailCtrl,
+        user::{UserCtrl, UserWithAccountAccessAndUsage},
+    },
     server_config::{cfg, UNKNOWN_CATEGORY},
     ServerState,
 };
 use crate::{
     email::client::{EmailMessage, MessageListOptions},
-    prompt::mistral::{self, CategoryPromptResponse},
+    model::user_token_usage::UserTokenUsageStatsCtrl,
+    prompt::{
+        mistral::{self, CategoryPromptResponse},
+        priority_queue::{Priority, PromptPriorityQueue},
+    },
+    rate_limiters::RateLimiters,
+    HttpClient,
 };
 
-#[derive(Display)]
+lazy_static::lazy_static!(
+    static ref DAILY_QUOTA: i64 = cfg.api.token_limits.daily_user_quota as i64;
+);
+
+#[derive(Display, Debug)]
 pub enum ProcessorStatus {
-    Processing,
-    Completed,
+    ProcessingHP,
+    ProcessingLP,
+    Idle,
     Cancelled,
     QuotaExceeded,
+    Failed,
 }
 
-#[derive(Display)]
-#[display("status:{status}, emails_processed:{emails_processed}, emails_failed:{emails_failed}, emails_remaining:{emails_remaining}, in processing:{num_in_processing}")]
+#[derive(Debug, Clone, Default)]
+struct FetchOptions {
+    more_recent_than: Option<chrono::Duration>,
+    categories: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
 pub struct EmailProcessorStatusUpdate {
     pub status: ProcessorStatus,
     pub emails_processed: i64,
     pub emails_failed: i64,
     pub emails_remaining: i64,
-    pub num_in_processing: i64,
+    pub num_in_processing: usize,
+    pub hp_emails: usize,
+    pub lp_emails: usize,
+    pub tokens_consumed: i64,
+    pub quota_remaining: i64,
 }
 
 #[derive(Clone)]
@@ -57,18 +84,24 @@ pub struct EmailProcessor {
     processed_email_count: Arc<AtomicI64>,
     failed_email_count: Arc<AtomicI64>,
     email_client: Arc<EmailClient>,
-    server_state: ServerState,
     token_count: Arc<AtomicI64>,
     cancelled: Arc<AtomicBool>,
-    email_queue: EmailProcessingQueue,
-    remaining_quota: i64,
+    failed: Arc<AtomicBool>,
+    http_client: HttpClient,
+    conn: DatabaseConnection,
+    rate_limiters: RateLimiters,
+    priority_queue: PromptPriorityQueue,
 }
 
 impl EmailProcessor {
-    pub async fn new(server_state: ServerState, user: UserWithAccountAccess) -> AppResult<Self> {
+    pub async fn new(
+        server_state: ServerState,
+        user: UserWithAccountAccessAndUsage,
+    ) -> AppResult<Self> {
         let user_id = user.id;
         let user_account_access_id = user.user_account_access_id;
         let email_address = user.email.clone();
+        let quota_used = user.tokens_consumed;
 
         let email_client = EmailClient::new(
             server_state.http_client.clone(),
@@ -86,15 +119,6 @@ impl EmailProcessor {
 
         tracing::info!("Email client created successfully for {}", email_address);
 
-        let quota_used = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserEmail.eq(email_address.clone()))
-            .filter(user_token_usage_stats::Column::Date.eq(chrono::Utc::now().date_naive()))
-            .one(&server_state.conn)
-            .await?
-            .map(|usage| usage.tokens_consumed)
-            .unwrap_or(0);
-
-        let remaining_quota = cfg.api.token_limits.daily_user_quota as i64 - quota_used;
         // -- DEBUG
         // println!("User's current usage: {}", quota_used);
         // println!("User's remaining quota: {}", remaining_quota);
@@ -106,12 +130,14 @@ impl EmailProcessor {
             email_address,
             processed_email_count: Arc::new(AtomicI64::new(0)),
             failed_email_count: Arc::new(AtomicI64::new(0)),
-            server_state,
             email_client: Arc::new(email_client),
-            token_count: Arc::new(AtomicI64::new(0)),
+            token_count: Arc::new(AtomicI64::new(quota_used)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            email_queue: EmailProcessingQueue::new(),
-            remaining_quota,
+            failed: Arc::new(AtomicBool::new(false)),
+            http_client: server_state.http_client.clone(),
+            conn: server_state.conn.clone(),
+            rate_limiters: server_state.rate_limiters.clone(),
+            priority_queue: server_state.priority_queue.clone(),
         };
 
         Ok(processor)
@@ -122,9 +148,84 @@ impl EmailProcessor {
         email_address: &str,
     ) -> AppResult<Self> {
         let user =
-            UserCtrl::get_with_account_access_by_email(&server_state.conn, email_address).await?;
+            UserCtrl::get_with_account_access_and_usage_by_email(&server_state.conn, email_address)
+                .await?;
 
         Self::new(server_state, user).await
+    }
+
+    pub async fn run(&self) -> AppResult<()> {
+        tracing::info!("Starting email processor for {}", self.email_address);
+        let mut last_run = chrono::DateTime::<Utc>::MIN_UTC;
+        const LOOP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+        loop {
+            let now = chrono::Utc::now();
+            if std::cmp::max(now - last_run, chrono::Duration::milliseconds(0))
+                < chrono::Duration::from_std(LOOP_DELAY).unwrap()
+            {
+                let delta = (now - last_run).to_std().unwrap_or(LOOP_DELAY);
+                tokio::time::sleep(delta).await;
+                continue;
+            }
+            last_run = now;
+
+            if self.is_cancelled() || self.is_quota_reached() {
+                break;
+            }
+
+            match self.email_client.configure_labels_if_needed().await {
+                Ok(true) => {
+                    tracing::info!("Labels configured successfully for {}", self.email_address);
+                }
+                Ok(false) => {
+                    tracing::info!("Labels already configured for {}", self.email_address);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Error configuring labels for {}: {:?}",
+                        self.email_address,
+                        e
+                    );
+                    self.fail();
+                    return Err(e.into());
+                }
+            };
+
+            if self
+                .priority_queue
+                .num_high_priority_in_queue(&self.email_address)
+                == 0
+            {
+                match self.queue_recent_emails().await {
+                    Ok(n) if n > 0 => {}
+                    // If there are no recent emails and sufficient quota remaining, queue older emails in low priority
+                    Ok(_) if self.current_token_usage() < (*DAILY_QUOTA / 2) => {
+                        match self.queue_older_emails().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    "Error queuing older emails for {}: {:?}",
+                                    self.email_address,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Error queuing recent emails for {}: {:?}",
+                            self.email_address,
+                            e
+                        );
+                        self.fail();
+                        return Err(e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn update_last_sync_time(&self) -> anyhow::Result<()> {
@@ -133,70 +234,132 @@ impl EmailProcessor {
             last_sync: ActiveValue::Set(Some(chrono::Utc::now().into())),
             ..Default::default()
         })
-        .exec(&self.server_state.conn)
+        .exec(&self.conn)
         .await
         .context("Error updating last sync time")?;
 
         Ok(())
     }
 
-    pub fn check_is_processing(&self) -> bool {
-        !self.is_cancelled() && !self.is_quota_reached() && !self.email_queue.is_empty()
-    }
-
-    pub async fn fetch_new_email_ids(&self) -> anyhow::Result<Vec<u128>> {
-        let message_list_resp = self
-            .email_client
-            .get_message_list(MessageListOptions {
-                more_recent_than: chrono::Duration::days(cfg.settings.email_max_age_days),
-                ..MessageListOptions::default()
-            })
-            .await?;
-
-        let message_ids: Vec<_> = message_list_resp
-            .messages
-            .as_ref()
-            .map(|list| list.iter().filter_map(|m| m.id.clone()).collect())
-            .unwrap_or_default();
-
+    async fn fetch_email_ids(
+        &self,
+        options: Option<FetchOptions>,
+    ) -> anyhow::Result<IndexSet<u128>> {
         #[derive(FromQueryResult)]
         struct ProcessedEmailId {
             id: String,
         }
 
         let already_processed_ids = processed_email::Entity::find()
-            .filter(processed_email::Column::Id.is_in(&message_ids))
+            .filter(processed_email::Column::UserId.eq(self.user_id))
             .select_only()
             .column(processed_email::Column::Id)
             .into_model::<ProcessedEmailId>()
-            .all(&self.server_state.conn)
+            .all(&self.conn)
             .await?
             .into_iter()
-            .map(|e| e.id)
+            .map(|e| parse_id_to_int(e.id))
             .collect::<HashSet<_>>();
 
-        let new_email_ids = message_ids
-            .into_iter()
-            .filter(|id| !already_processed_ids.contains(id))
-            .map(parse_id_to_int)
-            .collect::<Vec<_>>();
+        let mut message_ids_to_process = IndexSet::new();
+        let load_page = |next_page_token: Option<String>| async {
+            let resp = match self
+                .email_client
+                .get_message_list(MessageListOptions {
+                    page_token: next_page_token,
+                    more_recent_than: options.as_ref().and_then(|o| o.more_recent_than),
+                    categories: options.as_ref().and_then(|o| o.categories.clone()),
+                    ..Default::default()
+                })
+                .await
+                .context("Error loading next email page")
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::error!("Error loading next email page: {:?}", e);
+                    return Err::<_, anyhow::Error>(e);
+                }
+            };
 
-        Ok(new_email_ids)
+            Ok(resp)
+        };
+
+        // Collect at least 500 unprocessed emails or until there are no more emails
+        let mut next_page_token = None;
+        while let Ok(resp) = load_page(next_page_token.clone()).await {
+            next_page_token = resp.next_page_token.clone();
+
+            for id in resp
+                .messages
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.id.map(parse_id_to_int))
+                .filter(|id| !already_processed_ids.contains(id))
+            {
+                if message_ids_to_process.len() >= 500 {
+                    break;
+                }
+
+                message_ids_to_process.insert(id);
+            }
+
+            if next_page_token.is_none() || message_ids_to_process.len() >= 500 {
+                break;
+            }
+        }
+
+        Ok(message_ids_to_process)
     }
 
-    pub async fn queue_new_emails(&self) -> AppResult<()> {
-        let new_email_ids = self.fetch_new_email_ids().await?;
-        let num_added = self.email_queue.add_to_queue(new_email_ids);
-        tracing::info!(
-            "Add {} new emails to {}'s queue",
-            num_added,
-            self.email_address
-        );
+    async fn queue_recent_emails(&self) -> AppResult<i32> {
+        let new_email_ids = self
+            .fetch_email_ids(Some(FetchOptions {
+                more_recent_than: Some(chrono::Duration::days(14)),
+                ..Default::default()
+            }))
+            .await?;
 
-        Ok(())
+        if new_email_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut num_added = 0;
+        for email_id in &new_email_ids {
+            if self
+                .priority_queue
+                .push(self.email_address.clone(), *email_id, Priority::High)
+            {
+                num_added += 1;
+            }
+        }
+
+        Ok(num_added)
     }
 
-    pub async fn process_email(&self, email_message: &EmailMessage) -> AppResult<i64> {
+    async fn queue_older_emails(&self) -> AppResult<i32> {
+        let new_email_ids = self.fetch_email_ids(None).await?;
+        if new_email_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut num_added = 0;
+        for email_id in &new_email_ids {
+            if self
+                .priority_queue
+                .push(self.email_address.clone(), *email_id, Priority::Low)
+            {
+                num_added += 1;
+            }
+        }
+
+        Ok(num_added)
+    }
+
+    pub fn reset_quota(&self) {
+        self.token_count.store(0, Relaxed);
+    }
+
+    async fn parse_and_prompt_email(&self, email_message: &EmailMessage) -> anyhow::Result<i64> {
         let email_id = &email_message.id;
         let current_labels = &email_message.label_ids;
 
@@ -204,13 +367,9 @@ impl EmailProcessor {
             category: mut category_content,
             confidence,
             token_usage,
-        } = match mistral::send_category_prompt(&self.server_state, email_message).await {
-            Ok(resp) => Ok::<_, AppError>(resp),
-            Err(e) => {
-                tracing::error!("Error processing email {}: {:?}", email_id, e);
-                return Err::<_, AppError>(e);
-            }
-        }?;
+        } = mistral::send_category_prompt(&self.http_client, &self.rate_limiters, email_message)
+            .await
+            .map_err(|e| anyhow!("Error sending prompt: {e}"))?;
 
         let mut email_training: Option<email_training::ActiveModel> = None;
         if cfg.settings.training_mode {
@@ -277,7 +436,7 @@ impl EmailProcessor {
                         ])
                         .to_owned(),
                 )
-                .exec(&self.server_state.conn)
+                .exec(&self.conn)
                 .await
                 .context("Error inserting email training data")?;
         }
@@ -291,15 +450,18 @@ impl EmailProcessor {
             )
             .await?;
 
-        match ProcessedEmail::insert(processed_email::ActiveModel {
-            id: ActiveValue::Set(email_id.clone()),
-            user_id: ActiveValue::Set(self.user_id),
-            labels_applied: ActiveValue::Set(label_update.added),
-            labels_removed: ActiveValue::Set(label_update.removed),
-            ai_answer: ActiveValue::Set(category_content),
-            processed_at: ActiveValue::NotSet,
-        })
-        .exec(&self.server_state.conn)
+        match ProcessedEmailCtrl::insert(
+            &self.conn,
+            processed_email::ActiveModel {
+                id: ActiveValue::Set(email_id.clone()),
+                user_id: ActiveValue::Set(self.user_id),
+                labels_applied: ActiveValue::Set(label_update.added),
+                labels_removed: ActiveValue::Set(label_update.removed),
+                category: ActiveValue::Set(email_category.mail_label.clone()),
+                ai_answer: ActiveValue::Set(category_content),
+                processed_at: ActiveValue::NotSet,
+            },
+        )
         .await
         {
             Ok(_) => {}
@@ -316,96 +478,46 @@ impl EmailProcessor {
             },
         }
 
-        Ok::<_, AppError>(token_usage)
+        Ok(token_usage)
     }
 
-    pub async fn process_emails_in_queue(&self) -> anyhow::Result<()> {
-        if self.is_quota_reached() {
-            return Ok(());
+    async fn run_email_processes(&self, id: u128) -> anyhow::Result<i64> {
+        let email_id = parse_int_to_id(id);
+
+        let email_message = self
+            .email_client
+            .get_sanitized_message(&email_id)
+            .await
+            .context("Failed to fetch email")?;
+
+        self.rate_limiters.acquire_one().await;
+        self.parse_and_prompt_email(&email_message).await
+    }
+
+    pub async fn process_email(&self, id: u128, priority: Priority) {
+        if self.is_cancelled() || self.is_quota_reached() {
+            // Do not process email if processor is cancelled or quota is reached
+            return;
         }
 
-        if self.email_queue.is_empty() {
-            return Ok(());
+        if *DAILY_QUOTA - self.current_token_usage() < 100_000 && priority == Priority::Low {
+            // Do not process low priority emails if quota is almost reached
+            return;
         }
 
-        tracing::info!("Processing emails for {}", self.email_address);
-
-        match self.email_client.configure_labels_if_needed().await {
-            Ok(true) => {
-                tracing::info!("Labels configured successfully for {}", self.email_address);
-            }
-            Ok(false) => {
-                tracing::info!("Labels already configured for {}", self.email_address);
+        match self.run_email_processes(id).await {
+            Ok(token_usage) => {
+                self.fetch_add_total_emails_processed(1);
+                self.fetch_add_token_count(token_usage);
+                self.add_tally_to_user_daily_quota(token_usage)
+                    .await
+                    .unwrap_or_else(|e| tracing::error!("Error updating daily quota: {:?}", e));
             }
             Err(e) => {
-                tracing::error!(
-                    "Error configuring labels for {}: {:?}",
-                    self.email_address,
-                    e
-                );
-                return Err(e);
+                tracing::error!("Error processing email {}: {:?}", id, e);
+                self.fetch_add_total_emails_failed(1);
             }
         }
-
-        // Create 3 concurrent email processing threads to pull from queue
-        let handles = (0..3).map(|_| {
-            let queue = self.email_queue.clone();
-            let self_ = self.clone();
-            tokio::spawn(async move {
-                while let Some(id) = queue.get_next() {
-                    if self_.is_cancelled() {
-                        return EmailQueueStatus::Cancelled;
-                    }
-
-                    if self_.is_quota_reached() {
-                        return EmailQueueStatus::QuotaExceeded;
-                    }
-
-                    // Add to currently processing set
-                    self_.email_queue.add_to_currently_processing(id);
-                    let email_id = parse_int_to_id(id);
-
-                    let email_message =
-                        match self_.email_client.get_sanitized_message(&email_id).await {
-                            Ok(email_message) => email_message,
-                            Err(e) => {
-                                tracing::error!("Error fetching email {}: {:?}", email_id, e);
-                                self_.fetch_add_total_emails_failed(1);
-                                continue;
-                            }
-                        };
-
-                    self_.server_state.rate_limiters.acquire_one().await;
-
-                    match self_.process_email(&email_message).await {
-                        Ok(token_usage) => {
-                            self_.fetch_add_total_emails_processed(1);
-                            self_.fetch_add_token_count(token_usage);
-                        }
-                        Err(e) => {
-                            tracing::error!("Error processing email {}: {:?}", email_id, e);
-                            self_.fetch_add_total_emails_failed(1);
-                        }
-                    }
-
-                    // Remove from currently processing set
-                    self_.email_queue.remove_from_currently_processing(id);
-                }
-
-                EmailQueueStatus::Complete
-            })
-        });
-
-        for result in join_all(handles).await {
-            result.context("Email processing join error")?;
-        }
-
-        self.add_tally_to_user_daily_quota(self.current_token_usage())
-            .await?;
-
-        self.update_last_sync_time().await?;
-
-        Ok(())
     }
 
     async fn add_tally_to_user_daily_quota(&self, tokens: i64) -> anyhow::Result<()> {
@@ -413,57 +525,57 @@ impl EmailProcessor {
             return Ok(());
         }
 
-        tracing::info!(
-            "Adding {} tokens to user {}'s daily quota",
-            tokens,
-            self.email_address
-        );
+        let updated_tally =
+            UserTokenUsageStatsCtrl::add_to_daily_quota(&self.conn, &self.email_address, tokens)
+                .await
+                .map_err(|e| anyhow!("Error updating daily quota: {e}"))?;
 
-        // Update the user's token usage in the database
-        let existing = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserEmail.eq(self.email_address.clone()))
-            .filter(user_token_usage_stats::Column::Date.eq(chrono::Utc::now().date_naive()))
-            .one(&self.server_state.conn)
-            .await?;
-
-        let inserted = if let Some(existing) = existing {
-            UserTokenUsageStats::update_many()
-                .filter(user_token_usage_stats::Column::Id.eq(existing.id))
-                .col_expr(
-                    user_token_usage_stats::Column::TokensConsumed,
-                    Expr::col(user_token_usage_stats::Column::TokensConsumed).add(tokens),
-                )
-                .to_owned()
-                .exec(&self.server_state.conn)
-                .await?;
-
-            UserTokenUsageStats::find()
-                .filter(user_token_usage_stats::Column::Id.eq(existing.id))
-                .one(&self.server_state.conn)
-                .await?
-                .context("Could not find updated token usage record")?
-        } else {
-            let insertion = UserTokenUsageStats::insert(user_token_usage_stats::ActiveModel {
-                id: ActiveValue::NotSet,
-                user_email: ActiveValue::Set(self.email_address.clone()),
-                tokens_consumed: ActiveValue::Set(tokens),
-                date: ActiveValue::NotSet,
-                created_at: ActiveValue::NotSet,
-                updated_at: ActiveValue::NotSet,
-            })
-            .exec(&self.server_state.conn)
-            .await?;
-
-            UserTokenUsageStats::find()
-                .filter(user_token_usage_stats::Column::Id.eq(insertion.last_insert_id))
-                .one(&self.server_state.conn)
-                .await?
-                .context("Could not find inserted token usage record")?
-        };
-
-        self.set_token_count(inserted.tokens_consumed);
+        self.set_token_count(updated_tally);
 
         Ok(())
+    }
+
+    pub async fn cleanup_emails(&self) -> anyhow::Result<i32> {
+        struct EmailIdWithCategory {
+            id: String,
+            category: String,
+        }
+
+        let cleanup_settings =
+            CleanupSettingsCtrl::get_user_cleanup_settings(&self.conn, self.user_id)
+                .await
+                .unwrap_or_default();
+
+        let categories_with_action = cleanup_settings
+            .iter()
+            .filter(|s| s.action != CleanupAction::Nothing)
+            .map(|s| s.category.clone())
+            .collect::<Vec<_>>();
+
+        let processed_email_ready_for_cleanup =
+            ProcessedEmailCtrl::get_processed_emails_for_cleanup(
+                &self.conn,
+                self.user_id,
+                Utc::now(),
+                categories_with_action,
+            )
+            .await
+            .context("Could not fetch processed emails ready for cleanup")?;
+
+        // let emails
+
+        // let tasks = email_ids.into_iter().map(parse_int_to_id).map(|id| {
+        //     tokio::spawn(async {
+        //         let action = cleanup_settings.iter().find(|s| s. category == );
+        //         self.email_client.delete_email(&id)
+        //     })
+        // });
+
+        unimplemented!()
+    }
+
+    fn fail(&self) {
+        self.failed.store(true, Relaxed);
     }
 
     pub fn cancel(&self) {
@@ -479,7 +591,11 @@ impl EmailProcessor {
     }
 
     pub fn is_quota_reached(&self) -> bool {
-        self.token_count.load(Relaxed) >= self.remaining_quota
+        self.token_count.load(Relaxed) >= *DAILY_QUOTA
+    }
+
+    pub fn quota_remaining(&self) -> i64 {
+        *DAILY_QUOTA - self.current_token_usage()
     }
 
     pub fn current_token_usage(&self) -> i64 {
@@ -507,26 +623,53 @@ impl EmailProcessor {
     }
 
     pub fn emails_remaining(&self) -> i64 {
-        self.email_queue.len() as i64
+        self.priority_queue.num_in_queue(&self.email_address) as i64
     }
 
-    pub fn status(&self) -> EmailProcessorStatusUpdate {
-        let status = if self.check_is_processing() {
-            ProcessorStatus::Processing
-        } else if self.is_cancelled() {
-            ProcessorStatus::Cancelled
-        } else if self.is_quota_reached() {
-            ProcessorStatus::QuotaExceeded
-        } else {
-            ProcessorStatus::Completed
-        };
+    pub fn status(&self) -> ProcessorStatus {
+        match true {
+            _ if self.is_cancelled() => ProcessorStatus::Cancelled,
+            _ if self.is_quota_reached() => ProcessorStatus::QuotaExceeded,
+            _ if self.failed.load(Relaxed) => ProcessorStatus::Failed,
+            _ if self
+                .priority_queue
+                .num_high_priority_in_queue(&self.email_address)
+                > 0 =>
+            {
+                ProcessorStatus::ProcessingHP
+            }
+            _ if self
+                .priority_queue
+                .num_low_priority_in_queue(&self.email_address)
+                > 0 =>
+            {
+                ProcessorStatus::ProcessingLP
+            }
+            _ => ProcessorStatus::Idle,
+        }
+    }
+
+    pub fn get_current_state(&self) -> EmailProcessorStatusUpdate {
+        let status = self.status();
+
+        let num_processing_hp = self
+            .priority_queue
+            .num_high_priority_in_queue(&self.email_address);
+
+        let num_processing_lp = self
+            .priority_queue
+            .num_low_priority_in_queue(&self.email_address);
 
         EmailProcessorStatusUpdate {
             status,
             emails_processed: self.total_emails_processed(),
             emails_failed: self.total_emails_failed(),
             emails_remaining: self.emails_remaining(),
-            num_in_processing: self.email_queue.num_in_processing(),
+            num_in_processing: num_processing_lp + num_processing_hp,
+            hp_emails: num_processing_hp,
+            lp_emails: num_processing_lp,
+            tokens_consumed: self.current_token_usage(),
+            quota_remaining: *DAILY_QUOTA - self.current_token_usage(),
         }
     }
 }

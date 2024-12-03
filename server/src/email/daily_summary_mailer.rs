@@ -116,7 +116,7 @@ impl DailySummaryMailer {
 
             let label = labels
                 .iter()
-                .find(|label| label.contains("mailclerk:"))
+                .find(|label| label.contains("Mailclerk/"))
                 .cloned();
 
             if let Some(label) = label {

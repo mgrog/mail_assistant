@@ -2,13 +2,13 @@
 #[macro_use]
 mod macros;
 
-mod api_quota;
-mod auth_session_store;
+mod auth;
 mod cron_time_utils;
 mod db_core;
 mod email;
 mod error;
 mod model;
+mod notify;
 mod prompt;
 mod rate_limiters;
 mod request_tracing;
@@ -17,21 +17,24 @@ mod server_config;
 
 use std::{
     env,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 
 use anyhow::Context;
-use auth_session_store::AuthSessionStore;
+use auth::session_store::AuthSessionStore;
 use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, Router};
 use cron_time_utils::parse_offset_str;
 use db_core::prelude::*;
 use email::{
-    active_email_processors::ActiveProcessingQueue, tasks::email_processing_queue_cleanup,
+    active_email_processors::ActiveEmailProcessorMap, tasks::email_processing_map_cleanup,
 };
 use futures::future::join_all;
 use mimalloc::MiMalloc;
+use prompt::priority_queue::PromptPriorityQueue;
 use rate_limiters::RateLimiters;
 use reqwest::Certificate;
 use routes::AppRouter;
@@ -53,15 +56,9 @@ pub type PubsubClient = Arc<google_cloud_pubsub::client::Client>;
 struct ServerState {
     http_client: HttpClient,
     conn: DatabaseConnection,
-    token_count: TokenCounter,
     rate_limiters: RateLimiters,
     session_store: AuthSessionStore,
-}
-
-impl ServerState {
-    fn add_global_token_count(&self, count: i64) {
-        self.token_count.fetch_add(count as u64, Relaxed);
-    }
+    pub priority_queue: PromptPriorityQueue,
 }
 
 #[tokio::main]
@@ -86,9 +83,9 @@ async fn main() -> anyhow::Result<()> {
     let state = ServerState {
         http_client,
         conn,
-        token_count: Arc::new(AtomicU64::new(0)),
         rate_limiters: RateLimiters::from_env(),
         session_store,
+        priority_queue: PromptPriorityQueue::new(),
     };
 
     tracing_subscriber::registry()
@@ -97,9 +94,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let router = AppRouter::create(state.clone());
-    let email_processing_queue = ActiveProcessingQueue::new(state.clone(), 1_000);
-    let queue_watch_handle = email_processing_queue.watch().await;
-    let processor_cleanup_handle = email_processing_queue_cleanup(email_processing_queue.clone());
+    let email_processing_map = ActiveEmailProcessorMap::new(state.clone());
+    let processing_watch_handle = email_processing_map.watch();
+    let processor_cleanup_handle = email_processing_map_cleanup(email_processing_map.clone());
+    let email_queue_processing_handle = email::tasks::run_email_processing_loop(
+        state.priority_queue.clone(),
+        email_processing_map.clone(),
+    );
 
     let mut scheduler = JobScheduler::new()
         .await
@@ -107,124 +108,86 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let state_clone = state.clone();
-        let queue = email_processing_queue.clone();
+        let map = email_processing_map.clone();
         // Run full sync at startup
         scheduler
             .add(Job::new_one_shot_async(
                 Duration::from_secs(0),
-                move |uuid, _l| {
-                    let state = state_clone.clone();
-                    let queue = queue.clone();
-                    tracing::info!("Running full sync job {}", uuid);
-                    Box::pin(async move {
-                        match email::tasks::process_unsynced_user_emails(state, queue).await {
-                            Ok(_) => {
-                                tracing::info!("Email processor job {} succeeded", uuid);
-                            }
-                            Err(e) => {
-                                tracing::error!("Job failed: {:?}", e);
-                            }
-                        }
-                    })
-                },
+                move |uuid, _l| create_processors_for_users(state_clone.clone(), map.clone(), uuid),
             )?)
             .await?;
 
         let state_clone = state.clone();
-        let queue = email_processing_queue.clone();
+        let map = email_processing_map.clone();
         scheduler
-            .add(Job::new_async("0 * * * * *", move |uuid, mut l| {
-                let state = state_clone.clone();
-                let queue = queue.clone();
-                tracing::info!("Running full sync job {}", uuid);
-                Box::pin(async move {
-                    match email::tasks::process_unsynced_user_emails(state, queue).await {
-                        Ok(_) => {
-                            tracing::info!("Email processor job {} succeeded", uuid);
-                        }
-                        Err(e) => {
-                            tracing::error!("Job failed: {:?}", e);
-                        }
-                    }
-
-                    // Query the next execution time for this job
-                    let next_tick = l.next_tick_for_job(uuid).await;
-                    match next_tick {
-                        Ok(Some(ts)) => {
-                            println!("Next time for email sync job is {:?}", ts)
-                        }
-                        _ => {
-                            println!("Could not get next tick for email sync job")
-                        }
-                    }
-                })
+            .add(Job::new_async("0 * * * * *", move |uuid, _l| {
+                create_processors_for_users(state_clone.clone(), map.clone(), uuid)
             })?)
             .await?;
 
-        let user_settings_with_active_subscriptions = UserSettings::find()
-            .find_also_related(User)
-            .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-            .all(&state.conn)
-            .await?;
+        // let user_settings_with_active_subscriptions = UserSettings::find()
+        //     .find_also_related(User)
+        //     .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
+        //     .all(&state.conn)
+        //     .await?;
 
-        for (user_setting, user) in user_settings_with_active_subscriptions {
-            let state = state.clone();
-            let offset = match parse_offset_str(&user_setting.user_time_zone_offset) {
-                Ok(offset) => offset,
-                Err(e) => {
-                    tracing::error!("Failed to parse offset: {:?}", e);
-                    continue;
-                }
-            };
-            let user = user.context("User not found")?;
+        // for (user_setting, user) in user_settings_with_active_subscriptions {
+        //     let state = state.clone();
+        //     let offset = match parse_offset_str(&user_setting.user_time_zone_offset) {
+        //         Ok(offset) => offset,
+        //         Err(e) => {
+        //             tracing::error!("Failed to parse offset: {:?}", e);
+        //             continue;
+        //         }
+        //     };
+        //     let user = user.context("User not found")?;
 
-            tracing::info!(
-                "Adding daily summary mailer job for user {} at {}{}",
-                user_setting.user_email,
-                user_setting.daily_summary_time,
-                user_setting.user_time_zone_offset
-            );
-            let cron_time = format!("0 0 {} * * *", user_setting.daily_summary_time);
-            scheduler
-                .add(
-                    Job::new_async_tz(cron_time, offset, move |uuid, mut l| {
-                        let state = state.clone();
-                        Box::pin(async move {
-                            match email::tasks::send_user_daily_email_summary(&state, user.id).await
-                            {
-                                Ok(_) => {
-                                    tracing::info!("Daily summary mailer job {} succeeded", uuid);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Job failed: {:?}", e);
-                                }
-                            };
+        //     tracing::info!(
+        //         "Adding daily summary mailer job for user {} at {}{}",
+        //         user_setting.user_email,
+        //         user_setting.daily_summary_time,
+        //         user_setting.user_time_zone_offset
+        //     );
+        //     let cron_time = format!("0 0 {} * * *", user_setting.daily_summary_time);
+        //     scheduler
+        //         .add(
+        //             Job::new_async_tz(cron_time, offset, move |uuid, mut l| {
+        //                 let state = state.clone();
+        //                 Box::pin(async move {
+        //                     match email::tasks::send_user_daily_email_summary(&state, user.id).await
+        //                     {
+        //                         Ok(_) => {
+        //                             tracing::info!("Daily summary mailer job {} succeeded", uuid);
+        //                         }
+        //                         Err(e) => {
+        //                             tracing::error!("Job failed: {:?}", e);
+        //                         }
+        //                     };
 
-                            // Query the next execution time for this job
-                            let next_tick = l.next_tick_for_job(uuid).await;
-                            match next_tick {
-                                Ok(Some(ts)) => {
-                                    println!("Next time for daily summary mailer job is {:?}", ts)
-                                }
-                                _ => {
-                                    println!("Could not get next tick for daily summary mailer job")
-                                }
-                            }
-                        })
-                    })
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
+        //                     // Query the next execution time for this job
+        //                     let next_tick = l.next_tick_for_job(uuid).await;
+        //                     match next_tick {
+        //                         Ok(Some(ts)) => {
+        //                             println!("Next time for daily summary mailer job is {:?}", ts)
+        //                         }
+        //                         _ => {
+        //                             println!("Could not get next tick for daily summary mailer job")
+        //                         }
+        //                     }
+        //                 })
+        //             })
+        //             .unwrap(),
+        //         )
+        //         .await
+        //         .unwrap();
+        // }
 
         // Cleanup session storage
         let state_clone = state.clone();
         scheduler
             .add(Job::new_repeated(
-                Duration::from_secs(60),
+                Duration::from_secs(3 * 60),
                 move |_uuid, _lock| {
-                    tracing::info!("Running session storage cleanup job");
                     state_clone.session_store.clean_store();
                 },
             )?)
@@ -266,7 +229,8 @@ async fn main() -> anyhow::Result<()> {
         run_server(router),
         // inbox_subscription_handle,
         shutdown_handle,
-        queue_watch_handle,
+        processing_watch_handle,
+        email_queue_processing_handle,
         // process_emails_from_inbox_notifications_task,
         processor_cleanup_handle,
     ])
@@ -288,6 +252,26 @@ fn run_server(router: Router) -> JoinHandle<()> {
         tracing::debug!("listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         axum::serve(listener, router).await.unwrap();
+    })
+}
+
+fn create_processors_for_users(
+    state: ServerState,
+    map: ActiveEmailProcessorMap,
+    uuid: Uuid,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    let state = state.clone();
+    let map = map.clone();
+    tracing::info!("Job: {}\n Creating processors for active users...", uuid);
+    Box::pin(async move {
+        match email::tasks::add_users_to_processing(state, map).await {
+            Ok(_) => {
+                tracing::info!("Processor Creation Job {} succeeded", uuid);
+            }
+            Err(e) => {
+                tracing::error!("Job failed: {:?}", e);
+            }
+        }
     })
 }
 

@@ -15,18 +15,6 @@ model email_training {
   heuristics_used Boolean @default(false)
 }
 
-model inbox_settings {
-  id         Int     @id @default(autoincrement())
-  user_id    Int
-  category   String  @db.VarChar
-  skip_inbox Boolean
-  mark_spam  Boolean
-  user       user    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
-
-  @@unique([category, user_id])
-  @@index([user_id])
-}
-
 model processed_daily_summary {
   id         Int      @id @default(autoincrement())
   user_id    Int
@@ -40,6 +28,7 @@ model processed_email {
   id             String   @id @db.VarChar
   user_id        Int
   processed_at   DateTime @default(now()) @db.Timestamptz(6)
+  category       String   @db.VarChar
   labels_applied String[] @default([])
   labels_removed String[] @default([])
   ai_answer      String   @db.VarChar
@@ -59,15 +48,6 @@ model user_account_access {
   user          user     @relation(fields: [user_email], references: [email], onDelete: Cascade)
 }
 
-model user_settings {
-  id                    Int     @id @default(autoincrement())
-  daily_summary_enabled Boolean @default(true)
-  daily_summary_time    String  @default("06:00") @db.VarChar
-  user_time_zone_offset String  @default("-08") @db.VarChar
-  user_email            String  @unique @db.VarChar
-  user                  user    @relation(fields: [user_email], references: [email], onDelete: Cascade)
-}
-
 model user_token_usage_stats {
   id              Int      @id @default(autoincrement())
   date            DateTime @default(dbgenerated("CURRENT_DATE")) @db.Date
@@ -82,6 +62,7 @@ model user_token_usage_stats {
   @@unique([date, user_email])
   @@index([date])
   @@index([user_email])
+  @@index([user_email, month, year])
 }
 
 enum subscription_status {
@@ -99,11 +80,28 @@ model user {
   last_payment_attempt_at    DateTime?                 @db.Timestamptz(6)
   created_at                 DateTime                  @default(now()) @db.Timestamptz(6)
   updated_at                 DateTime                  @default(now()) @db.Timestamptz(6)
-  inbox_settings             inbox_settings[]
+  cleanup_settings           cleanup_settings[]
   processed_daily_summary    processed_daily_summary[]
   processed_email            processed_email[]
   user_token_usage_stats     user_token_usage_stats[]
-  user_settings              user_settings?
   user_account_access        user_account_access?
   last_sync                  DateTime?                 @db.Timestamptz(6)
+}
+
+enum cleanup_action {
+  DELETE
+  ARCHIVE
+  NOTHING
+}
+
+model cleanup_settings {
+  id       Int            @id @default(autoincrement())
+  user_id  Int
+  category String         @db.VarChar
+  days_old Int
+  action   cleanup_action
+  user     user           @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([category, user_id])
+  @@index([user_id])
 }

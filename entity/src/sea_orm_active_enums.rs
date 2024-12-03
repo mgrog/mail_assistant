@@ -3,6 +3,16 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "cleanup_action")]
+pub enum CleanupAction {
+    #[sea_orm(string_value = "ARCHIVE")]
+    Archive,
+    #[sea_orm(string_value = "DELETE")]
+    Delete,
+    #[sea_orm(string_value = "NOTHING")]
+    Nothing,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
 #[sea_orm(
     rs_type = "String",
     db_type = "Enum",

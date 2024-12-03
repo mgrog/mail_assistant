@@ -7,25 +7,27 @@ use std::{
 use crate::{
     db_core::prelude::*,
     model::{
-        user::UserWithAccountAccess,
-        user_inbox_settings::{CategoryInboxSettingsMap, UserInboxSettingsCtrl},
+        labels,
+        user::{self, AccountAccess, Id},
     },
 };
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use futures::future::join_all;
 use google_gmail1::api::{
-    Label, LabelColor, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
+    Label, ListLabelsResponse, ListMessagesResponse, Message, Profile, WatchResponse,
 };
-use indexmap::IndexSet;
+use lazy_static::lazy_static;
 use leaky_bucket::RateLimiter;
+use lib_email_clients::gmail::api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND};
+use lib_email_clients::gmail::label_colors::GmailLabelColorMap;
 use mail_parser::MessageParser;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
+use strum::IntoEnumIterator;
 
 use crate::{
-    api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND},
     model::response::LabelUpdate,
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
 };
@@ -45,15 +47,18 @@ macro_rules! gmail_url {
 /// Filter and paging options for message list
 pub struct MessageListOptions {
     /// Messages more recent than this duration will be returned
-    pub more_recent_than: chrono::Duration,
+    pub more_recent_than: Option<chrono::Duration>,
+    pub categories: Option<Vec<String>>,
     pub page_token: Option<String>,
+    pub max_results: Option<u32>,
 }
+
+const MAX_RESULTS_DEFAULT: u32 = 500;
 
 pub struct EmailClient {
     http_client: reqwest::Client,
     access_token: String,
     rate_limiter: RateLimiter,
-    pub category_inbox_settings: CategoryInboxSettingsMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +91,16 @@ type EmailClientResult<T> = Result<T, EmailClientError>;
 //     Ok(data)
 // }
 
+lazy_static! {
+    static ref COLOR_MAP: Lazy<GmailLabelColorMap> = Lazy::new(GmailLabelColorMap::new);
+}
+
+// TODO: Migrate Gmail specific parts to libs/email_clients/gmail
 impl EmailClient {
     pub async fn new(
         http_client: reqwest::Client,
         conn: DatabaseConnection,
-        mut user: UserWithAccountAccess,
+        mut user: impl AccountAccess + Id,
     ) -> anyhow::Result<EmailClient> {
         let rate_limiter = RateLimiter::builder()
             .initial(GMAIL_QUOTA_PER_SECOND)
@@ -98,29 +108,25 @@ impl EmailClient {
             .refill(GMAIL_QUOTA_PER_SECOND)
             .build();
 
-        let access_token = user
-            .get_valid_access_code(&conn, http_client.clone())
-            .await
-            .map_err(|e| anyhow!("Could not get new access code: {e}"))?;
+        let access_token = user::get_new_token(&http_client, &conn, &mut user).await?;
 
-        let user_configured_settings = UserInboxSettingsCtrl::get(&conn, user.id)
-            .await
-            .context("Could not find inbox settings")?;
+        // let user_configured_settings = UserInboxSettingsCtrl::get(&conn, user.id())
+        //     .await
+        //     .context("Could not retrieve inbox settings")?;
 
-        let mut category_inbox_settings = UserInboxSettingsCtrl::default();
-        category_inbox_settings.extend(user_configured_settings);
+        // let mut category_inbox_settings = UserInboxSettingsCtrl::default();
+        // category_inbox_settings.extend(user_configured_settings);
 
-        // This will be a map from mailclerk:* -> inbox_settings
-        let category_inbox_settings = category_inbox_settings
-            .into_iter()
-            .map(|(category, setting)| (format!("mailclerk:{}", category), setting))
-            .collect::<HashMap<_, _>>();
+        // This will be a map from Mailclerk/* -> inbox_settings
+        // let category_inbox_settings = category_inbox_settings
+        //     .into_iter()
+        //     .map(|(category, setting)| (format!("Mailclerk/{}", category), setting))
+        //     .collect::<HashMap<_, _>>();
 
         Ok(EmailClient {
             http_client,
             access_token,
             rate_limiter,
-            category_inbox_settings,
         })
     }
 
@@ -136,7 +142,6 @@ impl EmailClient {
             http_client,
             access_token,
             rate_limiter,
-            category_inbox_settings: HashMap::new(),
         }
     }
 
@@ -195,21 +200,23 @@ impl EmailClient {
 
         let labels_filter = labels.join(" AND NOT ");
 
-        let time_filter = format!(
-            "after:{}",
-            (Utc::now() - options.more_recent_than).timestamp()
-        );
+        let time_filter = options
+            .more_recent_than
+            .map(|duration| format!("after:{}", (Utc::now() - duration).timestamp()));
 
         // -- DEBUG
         // println!("Filter: {}", labels_filter);
         // -- DEBUG
 
+        let mut filters = vec![labels_filter];
+        if let Some(time_filter) = time_filter {
+            filters.push(time_filter);
+        }
+        let max_results = options.max_results.unwrap_or(MAX_RESULTS_DEFAULT);
+
         let mut query = vec![
-            (
-                "q".to_string(),
-                format!("{} {}", labels_filter, time_filter),
-            ),
-            ("maxResults".to_string(), "500".to_string()),
+            ("q".to_string(), filters.join(" ")),
+            ("maxResults".to_string(), max_results.to_string()),
         ];
 
         if let Some(token) = options.page_token {
@@ -264,7 +271,7 @@ impl EmailClient {
             .await?;
         let data = resp.json::<ListLabelsResponse>().await?;
 
-        Ok(data.labels.unwrap_or_default())
+        data.labels.context("No labels found")
     }
 
     pub async fn create_label(&self, label: Label) -> anyhow::Result<Label> {
@@ -285,7 +292,11 @@ impl EmailClient {
                 // Label already exists
                 return Ok(label);
             }
-            return Err(anyhow::anyhow!("Error creating label: {:?}", data));
+            return Err(anyhow::anyhow!(
+                "Error creating label: {:?} Error: {:?}",
+                label,
+                data
+            ));
         }
 
         Ok(serde_json::from_value(data)?)
@@ -314,11 +325,15 @@ impl EmailClient {
     }
 
     pub async fn configure_labels_if_needed(&self) -> anyhow::Result<bool> {
-        let existing_labels = self
-            .get_labels()
-            .await?
+        let current_labels = self.get_labels().await?;
+
+        let parent_label_exists = current_labels
             .iter()
-            .filter(|l| l.name.as_ref().map_or(false, |n| n.contains("mailclerk:")))
+            .any(|l| l.name.as_ref().map_or(false, |n| n == "Mailclerk"));
+
+        let existing_labels = current_labels
+            .iter()
+            .filter(|l| l.name.as_ref().map_or(false, |n| n.contains("Mailclerk/")))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -327,18 +342,15 @@ impl EmailClient {
         // -- DEBUG
 
         // Configure labels if they need it
-        let mut required_labels = cfg
+        let required_labels = cfg
             .categories
             .iter()
-            .chain(cfg.heuristics.iter())
-            .map(|c| c.mail_label.to_string())
+            .map(|c| c.mail_label.as_str())
+            .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
+            .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
+            .chain(labels::CleanupLabels::iter().map(|c| c.as_str()))
+            .map(|mail_label| format!("Mailclerk/{}", mail_label))
             .collect::<HashSet<_>>();
-
-        // Add Unknown category label
-        required_labels.insert(UNKNOWN_CATEGORY.mail_label.clone());
-
-        // Add Daily summary label
-        required_labels.insert(DAILY_SUMMARY_CATEGORY.mail_label.clone());
 
         let existing_label_names = existing_labels
             .iter()
@@ -367,29 +379,33 @@ impl EmailClient {
                 .collect::<Vec<_>>()
         };
 
-        if missing_labels.is_empty() && unneeded_labels.is_empty() {
+        if parent_label_exists && missing_labels.is_empty() && unneeded_labels.is_empty() {
             // Labels are already configured
             return Ok(false);
         }
 
-        static COLORS: Lazy<Vec<LabelColor>> = Lazy::new(|| {
-            LABEL_COLORS
-                .iter()
-                .map(|(_, bg, text)| LabelColor {
-                    background_color: Some(bg.to_string()),
-                    text_color: Some(text.to_string()),
-                })
-                .collect::<Vec<_>>()
-        });
-        let labels_to_add = cfg
-            .categories
-            .iter()
-            .chain(cfg.heuristics.iter())
-            .map(|c| c.mail_label.to_string())
-            .collect::<IndexSet<_>>();
+        if !parent_label_exists {
+            let label = Label {
+                id: None,
+                type_: Some("user".to_string()),
+                color: Some(COLOR_MAP.get("blue-600")),
+                name: Some("Mailclerk".to_string()),
+                messages_total: None,
+                messages_unread: None,
+                threads_total: None,
+                threads_unread: None,
+                message_list_visibility: Some("show".to_string()),
+                label_list_visibility: Some("labelShow".to_string()),
+            };
+            self.create_label(label)
+                .await
+                .context("Could not create parent label")?;
+        }
 
-        // Readd mailclerk labels
-        let add_label_tasks = labels_to_add.into_iter().enumerate().map(|(idx, label)| {
+        let labels_to_add = missing_labels.into_iter().collect::<Vec<_>>();
+
+        // Add mailclerk labels
+        let add_label_tasks = labels_to_add.into_iter().map(|label| {
             let (message_list_visibility, label_list_visibility) =
                 if label == UNKNOWN_CATEGORY.mail_label {
                     (Some("hide".to_string()), Some("labelHide".to_string()))
@@ -399,10 +415,12 @@ impl EmailClient {
                         Some("labelShowIfUnread".to_string()),
                     )
                 };
+            let label_name = label.split("Mailclerk/").nth(1).unwrap_or("");
+            let color = COLOR_MAP.get(label_name);
             let label = Label {
                 id: None,
                 type_: Some("user".to_string()),
-                color: COLORS.get(idx % COLORS.len()).cloned(),
+                color: Some(color),
                 name: Some(label.clone()),
                 messages_total: None,
                 messages_unread: None,
@@ -435,13 +453,7 @@ impl EmailClient {
 
         let results = join_all(add_label_tasks).await;
         for result in results {
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("{e}");
-                    // return Err(e);
-                }
-            }
+            result.context("Could not create label")?;
         }
 
         Ok(true)
@@ -450,7 +462,8 @@ impl EmailClient {
     /// Gets the label id for the mailclerk daily summary label, if doesn't exist, creates it
     pub async fn get_daily_summary_label_id(&self) -> anyhow::Result<String> {
         let existing_labels = self.get_labels().await?;
-        let daily_summary_label_name = DAILY_SUMMARY_CATEGORY.mail_label.clone();
+        let daily_summary_label_name =
+            format!("Mailclerk/{}", DAILY_SUMMARY_CATEGORY.mail_label.clone());
         if let Some(label) = existing_labels.iter().find(|l| {
             l.name
                 .as_ref()
@@ -462,10 +475,7 @@ impl EmailClient {
                 .create_label(Label {
                     id: None,
                     type_: Some("user".to_string()),
-                    color: Some(LabelColor {
-                        background_color: Some("#ffffff".to_string()),
-                        text_color: Some("#000000".to_string()),
-                    }),
+                    color: Some(COLOR_MAP.get("white")),
                     name: Some(daily_summary_label_name.clone()),
                     messages_total: None,
                     messages_unread: None,
@@ -490,9 +500,7 @@ impl EmailClient {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_modify)
             .await;
-        let inbox_settings = &self.category_inbox_settings;
-        let (json_body, update) =
-            build_label_update(user_labels, current_labels, category, inbox_settings)?;
+        let (json_body, update) = build_label_update(user_labels, current_labels, category)?;
         let resp = self
             .http_client
             .post(gmail_url!("messages", &email_id, "modify"))
@@ -529,6 +537,19 @@ impl EmailClient {
             .post(gmail_url!("messages"))
             .bearer_auth(&self.access_token)
             .json(&message)
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_message(&self, message_id: &str) -> anyhow::Result<()> {
+        self.rate_limiter
+            .acquire(GMAIL_API_QUOTA.messages_delete)
+            .await;
+        self.http_client
+            .delete(gmail_url!("messages", message_id))
+            .bearer_auth(&self.access_token)
             .send()
             .await?;
 
@@ -607,7 +628,6 @@ fn build_label_update(
     user_labels: Vec<Label>,
     current_labels: Vec<String>,
     category: Category,
-    inbox_settings: &CategoryInboxSettingsMap,
 ) -> anyhow::Result<(serde_json::Value, LabelUpdate)> {
     static RE_CATEGORY_LABEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"CATEGORY_+").unwrap());
 
@@ -619,24 +639,22 @@ fn build_label_update(
 
     let mut categories_to_add = category.gmail_categories;
 
-    let mut categories_to_remove = current_categories
-        .iter()
-        .filter(|c| !categories_to_add.contains(c))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if let Some(setting) = inbox_settings.get(&category.mail_label) {
-        // if setting.skip_inbox {
-        //     categories_to_remove.push("INBOX".to_string());
-        // }
-        if setting.mark_spam {
-            categories_to_add.push("SPAM".to_string());
-        }
-    }
+    // Only remove categories if you have a different category to add
+    let categories_to_remove = if categories_to_add.is_empty() {
+        None
+    } else {
+        Some(
+            current_categories
+                .iter()
+                .filter(|c| !categories_to_add.contains(c))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
 
     let label_id = user_labels
         .iter()
-        .find(|l| l.name.as_ref() == Some(&category.mail_label))
+        .find(|l| l.name.as_ref() == Some(&format!("Mailclerk/{}", category.mail_label)))
         .map(|l| l.id.clone().unwrap_or_default())
         .context(format!("Could not find {}!", category.mail_label))?;
 
@@ -661,145 +679,34 @@ fn build_label_update(
         json!(
             {
                 "addLabelIds": label_ids_to_add,
-                "removeLabelIds": categories_to_remove
+                "removeLabelIds": categories_to_remove.clone().unwrap_or_default()
             }
         ),
         LabelUpdate {
-            added: if label_names_applied.is_empty() {
-                None
-            } else {
-                Some(label_names_applied)
-            },
-            removed: if categories_to_remove.is_empty() {
-                None
-            } else {
-                Some(categories_to_remove)
-            },
+            added: Some(label_names_applied),
+            removed: categories_to_remove,
         },
     ))
 }
 
-const LABEL_COLORS: [(&str, &str, &str); 103] = [
-    ("Silver", "#e7e7e7", "#000000"),
-    ("Crimson", "#8a1c0a", "#ffffff"),
-    ("Orange", "#ff7537", "#ffffff"),
-    ("Gold", "#ffad47", "#000000"),
-    ("Green", "#1a764d", "#ffffff"),
-    ("Teal", "#2da2bb", "#ffffff"),
-    ("Blue", "#1c4587", "#ffffff"),
-    ("Purple", "#41236d", "#ffffff"),
-    ("Salmon", "#efa093", "#000000"),
-    ("Red Orange", "#fb4c2f", "#ffffff"),
-    ("Light Yellow", "#fad165", "#000000"),
-    ("Green", "#16a766", "#ffffff"),
-    ("Light Green", "#43d692", "#000000"),
-    ("Blue", "#4a86e8", "#ffffff"),
-    ("Purple", "#a479e2", "#ffffff"),
-    ("Pink", "#f691b3", "#000000"),
-    ("Light Pink", "#f6c5be", "#000000"),
-    ("Pale Peach", "#ffe6c7", "#000000"),
-    ("Light Cream", "#fef1d1", "#000000"),
-    ("Pale Green", "#b9e4d0", "#000000"),
-    ("Very Light Green", "#c6f3de", "#000000"),
-    ("Pale Blue", "#c9daf8", "#000000"),
-    ("Lavender", "#e4d7f5", "#000000"),
-    ("Light Pink", "#fcdee8", "#000000"),
-    ("Light Orange", "#ffd6a2", "#000000"),
-    ("Pale Yellow", "#fce8b3", "#000000"),
-    ("Mint Green", "#89d3b2", "#000000"),
-    ("Light Mint", "#a0eac9", "#000000"),
-    ("Light Blue", "#a4c2f4", "#000000"),
-    ("Light Lavender", "#d0bcf1", "#000000"),
-    ("Light Pink", "#fbc8d9", "#000000"),
-    ("Coral", "#e66550", "#ffffff"),
-    ("Light Orange", "#ffbc6b", "#000000"),
-    ("Pale Yellow", "#fcda83", "#000000"),
-    ("Green", "#44b984", "#ffffff"),
-    ("Light Green", "#68dfa9", "#000000"),
-    ("Blue", "#6d9eeb", "#ffffff"),
-    ("Lavender", "#b694e8", "#ffffff"),
-    ("Pink", "#f7a7c0", "#000000"),
-    ("Dark Red", "#cc3a21", "#ffffff"),
-    ("Orange", "#eaa041", "#000000"),
-    ("Yellow", "#f2c960", "#000000"),
-    ("Dark Green", "#149e60", "#ffffff"),
-    ("Light Green", "#3dc789", "#000000"),
-    ("Blue", "#3c78d8", "#ffffff"),
-    ("Purple", "#8e63ce", "#ffffff"),
-    ("Pink", "#e07798", "#000000"),
-    ("Dark Red", "#ac2b16", "#ffffff"),
-    ("Orange", "#cf8933", "#000000"),
-    ("Yellow", "#d5ae49", "#000000"),
-    ("Dark Green", "#0b804b", "#ffffff"),
-    ("Green", "#2a9c68", "#ffffff"),
-    ("Blue", "#285bac", "#ffffff"),
-    ("Purple", "#653e9b", "#ffffff"),
-    ("Pink", "#b65775", "#000000"),
-    ("Dark Red", "#822111", "#ffffff"),
-    ("Orange", "#a46a21", "#000000"),
-    ("Yellow", "#aa8831", "#000000"),
-    ("Dark Green", "#076239", "#ffffff"),
-    ("Pink", "#83334c", "#ffffff"),
-    ("Dark Gray", "#464646", "#ffffff"),
-    ("Light Gray", "#e7e7e7", "#000000"),
-    ("Dark Blue", "#0d3472", "#ffffff"),
-    ("Light Blue", "#b6cff5", "#000000"),
-    ("Dark Teal", "#0d3b44", "#ffffff"),
-    ("Light Teal", "#98d7e4", "#000000"),
-    ("Dark Purple", "#3d188e", "#ffffff"),
-    ("Light Lavender", "#e3d7ff", "#000000"),
-    ("Dark Pink", "#711a36", "#ffffff"),
-    ("Light Pink", "#fbd3e0", "#000000"),
-    ("Light Red", "#f2b2a8", "#000000"),
-    ("Dark Brown", "#7a2e0b", "#ffffff"),
-    ("Light Brown", "#ffc8af", "#000000"),
-    ("Dark Orange", "#7a4706", "#ffffff"),
-    ("Light Orange", "#ffdeb5", "#000000"),
-    ("Dark Yellow", "#594c05", "#ffffff"),
-    ("Light Yellow", "#fbe983", "#000000"),
-    ("Dark Brown", "#684e07", "#ffffff"),
-    ("Light Brown", "#fdedc1", "#000000"),
-    ("Dark Green", "#0b4f30", "#ffffff"),
-    ("Light Green", "#b3efd3", "#000000"),
-    ("Dark Green", "#04502e", "#ffffff"),
-    ("Light Green", "#a2dcc1", "#000000"),
-    ("Gray", "#c2c2c2", "#000000"),
-    ("Blue", "#4986e7", "#ffffff"),
-    ("Lavender", "#b99aff", "#000000"),
-    ("Dark Pink", "#994a64", "#ffffff"),
-    ("Pink", "#f691b2", "#000000"),
-    ("Golden Yellow", "#ffad46", "#000000"),
-    ("Dark Red", "#662e37", "#ffffff"),
-    ("Light Gray", "#ebdbde", "#000000"),
-    ("Light Pink", "#cca6ac", "#000000"),
-    ("Dark Green", "#094228", "#ffffff"),
-    ("Light Green", "#42d692", "#000000"),
-    ("Green", "#16a765", "#ffffff"),
-    ("White", "#ffffff", "#000000"),
-    ("Black", "#000000", "#ffffff"),
-    ("Dark Gray", "#434343", "#ffffff"),
-    ("Gray", "#666666", "#ffffff"),
-    ("Light Gray", "#999999", "#000000"),
-    ("Very Light Gray", "#cccccc", "#000000"),
-    ("Pale Gray", "#efefef", "#000000"),
-    ("Almost White", "#f3f3f3", "#000000"),
-];
-
-// fn get_label_color(_label: &str) -> LabelColor {
-//     let color_map = Lazy::new(|| LABEL_COLORS.iter().cloned().collect::<HashMap<_, _>>());
-//     let bg = color_map.get("Dark Gray").map(|c| c.to_string());
-//     let text = color_map.get("White").map(|c| c.to_string());
-//     LabelColor {
-//         background_color: bg,
-//         text_color: text,
-//     }
-// }
+fn get_required_labels() -> HashSet<String> {
+    cfg.categories
+        .iter()
+        .map(|c| c.mail_label.as_str())
+        .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
+        .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
+        .chain(labels::CleanupLabels::iter().map(|c| c.as_str()))
+        .map(|mail_label| format!("Mailclerk/{}", mail_label))
+        .collect::<HashSet<_>>()
+}
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use google_gmail1::api::Label;
+
+    use crate::email::client::get_required_labels;
 
     #[test]
     fn test_gmail_url() {
@@ -828,7 +735,6 @@ mod tests {
                 gmail_categories: vec!["CATEGORY_PROMOTIONS".to_string()],
                 important: None,
             },
-            &HashMap::new(),
         ) {
             Ok((json_body, update)) => {
                 assert_eq!(
@@ -903,5 +809,13 @@ mod tests {
         ).to_string())
         };
         assert_eq!(sanitized, test);
+    }
+
+    #[test]
+    fn test_get_required_labels() {
+        dotenvy::dotenv().ok();
+        let required_labels = get_required_labels();
+        dbg!(&required_labels);
+        assert_eq!(true, false)
     }
 }

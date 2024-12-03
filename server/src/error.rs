@@ -1,34 +1,37 @@
-// use aws_sdk_bedrockruntime::operation::converse::ConverseError;
+use anyhow::anyhow;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use derive_more::derive::Display;
 use lib_utils::crypt;
 use num_derive::{FromPrimitive, ToPrimitive};
 use serde_json::json;
 use sqlx::error::DatabaseError;
 
-use crate::db_core::prelude::*;
+use crate::{auth::jwt::AuthError, db_core::prelude::*};
 
 pub type AppResult<T> = Result<T, AppError>;
 pub type AppJsonResult<T> = AppResult<Json<T>>;
 
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum AppError {
     NotFound(String),
     BadRequest(String),
     Internal(anyhow::Error),
     RequestTimeout,
     TooManyRequests,
-    Unauthorized(String),
     DbError(sea_orm::error::DbErr),
     Conflict(String),
+    Unauthorized(String),
     // AiPrompt(BedrockConverseError),
     EncryptToken,
     DecryptToken,
     Oauth2,
 }
+
+impl std::error::Error for AppError {}
 
 impl From<anyhow::Error> for AppError {
     fn from(error: anyhow::Error) -> Self {
@@ -62,6 +65,19 @@ impl From<crypt::Error> for AppError {
             crypt::Error::DecryptFailed(_) => AppError::DecryptToken,
             crypt::Error::DecodeFailed(_) => AppError::DecryptToken,
             crypt::Error::StringConversionFailed(_) => AppError::DecryptToken,
+        }
+    }
+}
+
+impl From<AuthError> for AppError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::TokenCreation => AppError::Internal(anyhow!("Error creating token")),
+            AuthError::InvalidToken => AppError::Unauthorized("Invalid Token".to_string()),
+            AuthError::MissingCredentials => {
+                AppError::Unauthorized("Missing credentials".to_string())
+            }
+            AuthError::WrongCredentials => AppError::Unauthorized("Wrong credentials".to_string()),
         }
     }
 }

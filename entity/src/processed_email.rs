@@ -12,6 +12,7 @@ pub struct Model {
     pub labels_applied: Option<Vec<String>>,
     pub labels_removed: Option<Vec<String>>,
     pub ai_answer: String,
+    pub category: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -20,7 +21,7 @@ pub enum Relation {
         belongs_to = "super::user::Entity",
         from = "Column::UserId",
         to = "super::user::Column::Id",
-        on_update = "NoAction",
+        on_update = "Cascade",
         on_delete = "Cascade"
     )]
     User,
