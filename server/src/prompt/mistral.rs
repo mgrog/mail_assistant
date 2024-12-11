@@ -21,12 +21,26 @@ lazy_static! {
     You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.
     [{}]
     You should try to choose a single category from the above, along with its confidence score. 
-    You will only respond with a JSON object with the key category and confidence. Do not provide explanations or multiple categories.
+    You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.
 
     #", get_ai_categories().join(", "));
 }
 
 const AI_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
+
+fn get_system_prompt() -> String {
+    const SYSTEM_INTRO: &str = "You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.";
+    const SYSTEM_OUTRO: &str = concat!(
+    "You should try to choose a single category from the above, along with its confidence score.",
+    "You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.");
+
+    format!(
+        "{}\n{}\n{}",
+        SYSTEM_INTRO,
+        get_ai_categories().join(", "),
+        SYSTEM_OUTRO
+    )
+}
 
 fn get_ai_categories() -> Vec<String> {
     cfg.categories.iter().map(|c| c.content.clone()).collect()

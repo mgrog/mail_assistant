@@ -15,26 +15,41 @@ pub struct Model {
     pub last_payment_attempt_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub last_sync: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::cleanup_settings::Entity")]
-    CleanupSettings,
+    #[sea_orm(has_many = "super::auto_cleanup_setting::Entity")]
+    AutoCleanupSetting,
+    #[sea_orm(has_many = "super::custom_email_rule::Entity")]
+    CustomEmailRule,
+    #[sea_orm(has_many = "super::default_email_rule_override::Entity")]
+    DefaultEmailRuleOverride,
     #[sea_orm(has_many = "super::processed_daily_summary::Entity")]
     ProcessedDailySummary,
     #[sea_orm(has_many = "super::processed_email::Entity")]
     ProcessedEmail,
     #[sea_orm(has_one = "super::user_account_access::Entity")]
     UserAccountAccess,
-    #[sea_orm(has_many = "super::user_token_usage_stats::Entity")]
-    UserTokenUsageStats,
+    #[sea_orm(has_many = "super::user_token_usage_stat::Entity")]
+    UserTokenUsageStat,
 }
 
-impl Related<super::cleanup_settings::Entity> for Entity {
+impl Related<super::auto_cleanup_setting::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::CleanupSettings.def()
+        Relation::AutoCleanupSetting.def()
+    }
+}
+
+impl Related<super::custom_email_rule::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CustomEmailRule.def()
+    }
+}
+
+impl Related<super::default_email_rule_override::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DefaultEmailRuleOverride.def()
     }
 }
 
@@ -56,9 +71,9 @@ impl Related<super::user_account_access::Entity> for Entity {
     }
 }
 
-impl Related<super::user_token_usage_stats::Entity> for Entity {
+impl Related<super::user_token_usage_stat::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::UserTokenUsageStats.def()
+        Relation::UserTokenUsageStat.def()
     }
 }
 

@@ -9,11 +9,11 @@ pub struct UserTokenUsageStatsCtrl;
 
 impl UserTokenUsageStatsCtrl {
     pub async fn get_usage_today(conn: &DatabaseConnection, user_email: &str) -> AppResult<i64> {
-        let usage = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserEmail.eq(user_email))
-            .filter(user_token_usage_stats::Column::Date.eq(chrono::Utc::now().date_naive()))
+        let usage = UserTokenUsageStat::find()
+            .filter(user_token_usage_stat::Column::UserEmail.eq(user_email))
+            .filter(user_token_usage_stat::Column::Date.eq(chrono::Utc::now().date_naive()))
             .select_only()
-            .column(user_token_usage_stats::Column::TokensConsumed)
+            .column(user_token_usage_stat::Column::TokensConsumed)
             .one(conn)
             .await?
             .map(|usage| usage.tokens_consumed)
@@ -39,7 +39,7 @@ impl UserTokenUsageStatsCtrl {
             DbBackend::Postgres,
             r#"
                 SELECT COALESCE(SUM(tokens_consumed), 0) as total_tokens
-                FROM user_token_usage_stats
+                FROM user_token_usage_stat
                 WHERE EXTRACT(MONTH FROM date) = $1
                 AND EXTRACT(YEAR FROM date) = $2
                 AND user_email = $3
@@ -62,32 +62,32 @@ impl UserTokenUsageStatsCtrl {
         let today = chrono::Utc::now().date_naive();
 
         // Update the user's token usage in the database
-        let existing = UserTokenUsageStats::find()
-            .filter(user_token_usage_stats::Column::UserEmail.eq(user_email))
-            .filter(user_token_usage_stats::Column::Date.eq(today))
+        let existing = UserTokenUsageStat::find()
+            .filter(user_token_usage_stat::Column::UserEmail.eq(user_email))
+            .filter(user_token_usage_stat::Column::Date.eq(today))
             .one(conn)
             .await?;
 
         let inserted = if let Some(existing) = existing {
-            UserTokenUsageStats::update_many()
-                .filter(user_token_usage_stats::Column::Id.eq(existing.id))
+            UserTokenUsageStat::update_many()
+                .filter(user_token_usage_stat::Column::Id.eq(existing.id))
                 .col_expr(
-                    user_token_usage_stats::Column::TokensConsumed,
-                    Expr::col(user_token_usage_stats::Column::TokensConsumed).add(tokens),
+                    user_token_usage_stat::Column::TokensConsumed,
+                    Expr::col(user_token_usage_stat::Column::TokensConsumed).add(tokens),
                 )
                 .to_owned()
                 .exec(conn)
                 .await?;
 
-            UserTokenUsageStats::find()
-                .filter(user_token_usage_stats::Column::Id.eq(existing.id))
+            UserTokenUsageStat::find()
+                .filter(user_token_usage_stat::Column::Id.eq(existing.id))
                 .one(conn)
                 .await?
                 .ok_or(AppError::NotFound(
                     "Could not find updated token usage record".to_string(),
                 ))?
         } else {
-            let insertion = UserTokenUsageStats::insert(user_token_usage_stats::ActiveModel {
+            let insertion = UserTokenUsageStat::insert(user_token_usage_stat::ActiveModel {
                 id: ActiveValue::NotSet,
                 user_email: ActiveValue::Set(user_email.to_string()),
                 tokens_consumed: ActiveValue::Set(tokens),
@@ -100,8 +100,8 @@ impl UserTokenUsageStatsCtrl {
             .exec(conn)
             .await?;
 
-            UserTokenUsageStats::find()
-                .filter(user_token_usage_stats::Column::Id.eq(insertion.last_insert_id))
+            UserTokenUsageStat::find()
+                .filter(user_token_usage_stat::Column::Id.eq(insertion.last_insert_id))
                 .one(conn)
                 .await?
                 .ok_or(AppError::NotFound(

@@ -149,7 +149,6 @@ pub async fn handler_auth_gmail_callback(
         subscription_status: ActiveValue::NotSet,
         last_payment_attempt_at: ActiveValue::NotSet,
         last_successful_payment_at: ActiveValue::NotSet,
-        last_sync: ActiveValue::NotSet,
     })
     .on_conflict(
         OnConflict::column(user::Column::Email)

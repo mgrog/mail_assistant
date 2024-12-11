@@ -23,7 +23,7 @@ impl Ord for PromptQueueEmailEntry {
         match (self, other) {
             (Self { priority: High, .. }, Self { priority: Low, .. }) => Ordering::Greater,
             (Self { priority: Low, .. }, Self { priority: High, .. }) => Ordering::Less,
-            _ => self.email_id.cmp(&other.email_id),
+            _ => Ordering::Equal,
         }
     }
 }
@@ -171,5 +171,9 @@ impl PromptPriorityQueue {
             .values()
             .map(|e| e.high_priority + e.low_priority)
             .sum()
+    }
+
+    pub fn num_in_processing(&self) -> usize {
+        self.in_processing_set.lock().unwrap().len()
     }
 }

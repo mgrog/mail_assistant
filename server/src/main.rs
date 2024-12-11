@@ -24,10 +24,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use auth::session_store::AuthSessionStore;
-use axum::{extract::FromRef, http::StatusCode, response::IntoResponse, Router};
-use cron_time_utils::parse_offset_str;
+use axum::{extract::FromRef, Router};
 use db_core::prelude::*;
 use email::{
     active_email_processors::ActiveEmailProcessorMap, tasks::email_processing_map_cleanup,
@@ -38,9 +36,8 @@ use prompt::priority_queue::PromptPriorityQueue;
 use rate_limiters::RateLimiters;
 use reqwest::Certificate;
 use routes::AppRouter;
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use server_config::get_cert;
-use std::sync::atomic::Ordering::Relaxed;
 use tokio::{signal, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -95,7 +92,11 @@ async fn main() -> anyhow::Result<()> {
 
     let router = AppRouter::create(state.clone());
     let email_processing_map = ActiveEmailProcessorMap::new(state.clone());
-    let processing_watch_handle = email_processing_map.watch();
+    let processing_watch_handle = email::tasks::watch(
+        state.priority_queue.clone(),
+        email_processing_map.clone(),
+        state.rate_limiters.clone(),
+    );
     let processor_cleanup_handle = email_processing_map_cleanup(email_processing_map.clone());
     let email_queue_processing_handle = email::tasks::run_email_processing_loop(
         state.priority_queue.clone(),
@@ -109,78 +110,22 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let map = email_processing_map.clone();
-        // Run full sync at startup
         scheduler
             .add(Job::new_one_shot_async(
-                Duration::from_secs(0),
-                move |uuid, _l| create_processors_for_users(state_clone.clone(), map.clone(), uuid),
+                Duration::from_secs(1),
+                move |uuid, l| {
+                    create_processors_for_users(uuid, l, state_clone.clone(), map.clone())
+                },
             )?)
             .await?;
 
         let state_clone = state.clone();
         let map = email_processing_map.clone();
         scheduler
-            .add(Job::new_async("0 * * * * *", move |uuid, _l| {
-                create_processors_for_users(state_clone.clone(), map.clone(), uuid)
+            .add(Job::new_async("0 * * * * *", move |uuid, l| {
+                create_processors_for_users(uuid, l, state_clone.clone(), map.clone())
             })?)
             .await?;
-
-        // let user_settings_with_active_subscriptions = UserSettings::find()
-        //     .find_also_related(User)
-        //     .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-        //     .all(&state.conn)
-        //     .await?;
-
-        // for (user_setting, user) in user_settings_with_active_subscriptions {
-        //     let state = state.clone();
-        //     let offset = match parse_offset_str(&user_setting.user_time_zone_offset) {
-        //         Ok(offset) => offset,
-        //         Err(e) => {
-        //             tracing::error!("Failed to parse offset: {:?}", e);
-        //             continue;
-        //         }
-        //     };
-        //     let user = user.context("User not found")?;
-
-        //     tracing::info!(
-        //         "Adding daily summary mailer job for user {} at {}{}",
-        //         user_setting.user_email,
-        //         user_setting.daily_summary_time,
-        //         user_setting.user_time_zone_offset
-        //     );
-        //     let cron_time = format!("0 0 {} * * *", user_setting.daily_summary_time);
-        //     scheduler
-        //         .add(
-        //             Job::new_async_tz(cron_time, offset, move |uuid, mut l| {
-        //                 let state = state.clone();
-        //                 Box::pin(async move {
-        //                     match email::tasks::send_user_daily_email_summary(&state, user.id).await
-        //                     {
-        //                         Ok(_) => {
-        //                             tracing::info!("Daily summary mailer job {} succeeded", uuid);
-        //                         }
-        //                         Err(e) => {
-        //                             tracing::error!("Job failed: {:?}", e);
-        //                         }
-        //                     };
-
-        //                     // Query the next execution time for this job
-        //                     let next_tick = l.next_tick_for_job(uuid).await;
-        //                     match next_tick {
-        //                         Ok(Some(ts)) => {
-        //                             println!("Next time for daily summary mailer job is {:?}", ts)
-        //                         }
-        //                         _ => {
-        //                             println!("Could not get next tick for daily summary mailer job")
-        //                         }
-        //                     }
-        //                 })
-        //             })
-        //             .unwrap(),
-        //         )
-        //         .await
-        //         .unwrap();
-        // }
 
         // Cleanup session storage
         let state_clone = state.clone();
@@ -256,9 +201,10 @@ fn run_server(router: Router) -> JoinHandle<()> {
 }
 
 fn create_processors_for_users(
+    uuid: Uuid,
+    mut l: JobScheduler,
     state: ServerState,
     map: ActiveEmailProcessorMap,
-    uuid: Uuid,
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
     let state = state.clone();
     let map = map.clone();
@@ -273,9 +219,9 @@ fn create_processors_for_users(
             }
         }
         map.cleanup_stopped_processors();
+        let next_tick = l.next_tick_for_job(uuid).await;
+        if let Ok(Some(ts)) = next_tick {
+            tracing::info!("Next time for processor creation job is {:?}", ts)
+        }
     })
-}
-
-pub async fn handler_404() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, "Route does not exist")
 }

@@ -1,18 +1,13 @@
 use std::{
     collections::HashSet,
-    sync::{
-        atomic::{AtomicBool, AtomicI64},
-        Arc,
-    },
+    sync::{atomic::AtomicI64, Arc},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use derive_more::Display;
-use entity::{
-    email_training, prelude::*, processed_email, sea_orm_active_enums::CleanupAction, user,
-};
+use entity::{email_training, prelude::*, processed_email, sea_orm_active_enums::CleanupAction};
 use indexmap::IndexSet;
 use num_traits::FromPrimitive;
 use sea_orm::{
@@ -20,31 +15,26 @@ use sea_orm::{
     FromQueryResult,
 };
 use std::sync::atomic::Ordering::Relaxed;
+use tokio::sync::watch;
 
 use crate::{
-    email::client::EmailClient,
+    email::client::{EmailClient, EmailMessage, MessageListOptions},
+    email::rules::UserEmailRules,
     error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
-    model::{
-        cleanup_settings::CleanupSettingsCtrl,
-        processed_email::ProcessedEmailCtrl,
-        user::{UserCtrl, UserWithAccountAccessAndUsage},
-    },
-    server_config::{cfg, UNKNOWN_CATEGORY},
-    ServerState,
-};
-use crate::{
-    email::client::{EmailMessage, MessageListOptions},
     model::user_token_usage::UserTokenUsageStatsCtrl,
+    model::{processed_email::ProcessedEmailCtrl, user::UserWithAccountAccessAndUsage},
     prompt::{
         mistral::{self, CategoryPromptResponse},
         priority_queue::{Priority, PromptPriorityQueue},
     },
     rate_limiters::RateLimiters,
-    HttpClient,
+    server_config::{cfg, UNKNOWN_CATEGORY},
+    HttpClient, ServerState,
 };
 
 lazy_static::lazy_static!(
     static ref DAILY_QUOTA: i64 = cfg.api.token_limits.daily_user_quota as i64;
+    static ref LOW_PRIORITY_CUTOFF: i64 = *DAILY_QUOTA / 2;
 );
 
 #[derive(Display, Debug)]
@@ -55,6 +45,13 @@ pub enum ProcessorStatus {
     Cancelled,
     QuotaExceeded,
     Failed,
+}
+
+enum InterruptSignal {
+    Run,
+    Cancel,
+    Quota,
+    Fail,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,7 +66,7 @@ pub struct EmailProcessorStatusUpdate {
     pub emails_processed: i64,
     pub emails_failed: i64,
     pub emails_remaining: i64,
-    pub num_in_processing: usize,
+    pub total_emails: usize,
     pub hp_emails: usize,
     pub lp_emails: usize,
     pub tokens_consumed: i64,
@@ -77,21 +74,25 @@ pub struct EmailProcessorStatusUpdate {
 }
 
 #[derive(Clone)]
-// This struct processes emails for a single user
+// EmailProcessor processes emails for a single user
 pub struct EmailProcessor {
     pub user_id: i32,
     pub user_account_access_id: i32,
     pub email_address: String,
+    pub created_at: chrono::DateTime<Utc>,
     processed_email_count: Arc<AtomicI64>,
     failed_email_count: Arc<AtomicI64>,
     email_client: Arc<EmailClient>,
     token_count: Arc<AtomicI64>,
-    cancelled: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
     http_client: HttpClient,
     conn: DatabaseConnection,
     rate_limiters: RateLimiters,
     priority_queue: PromptPriorityQueue,
+    user_email_rules: Arc<UserEmailRules>,
+    interrupt_channel: (
+        tokio::sync::watch::Sender<InterruptSignal>,
+        tokio::sync::watch::Receiver<InterruptSignal>,
+    ),
 }
 
 impl EmailProcessor {
@@ -103,20 +104,20 @@ impl EmailProcessor {
         let user_account_access_id = user.user_account_access_id;
         let email_address = user.email.clone();
         let quota_used = user.tokens_consumed;
+        let conn = server_state.conn.clone();
+        let http_client = server_state.http_client.clone();
+        let rate_limiters = server_state.rate_limiters.clone();
+        let priority_queue = server_state.priority_queue.clone();
 
-        let email_client = EmailClient::new(
-            server_state.http_client.clone(),
-            server_state.conn.clone(),
-            user,
-        )
-        .await
-        .map_err(|e| {
-            AppError::Internal(anyhow!(
-                "Could not create email client for: {}, error: {}",
-                email_address,
-                e.to_string()
-            ))
-        })?;
+        let email_client = EmailClient::new(http_client.clone(), conn.clone(), user)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow!(
+                    "Could not create email client for: {}, error: {}",
+                    email_address,
+                    e.to_string()
+                ))
+            })?;
 
         tracing::info!("Email client created successfully for {}", email_address);
 
@@ -125,37 +126,41 @@ impl EmailProcessor {
         // println!("User's remaining quota: {}", remaining_quota);
         // -- DEBUG
 
+        let user_email_rules = UserEmailRules::from_user(&conn, user_id).await?;
+        let interrupt_channel = watch::channel(InterruptSignal::Run);
+
         let processor = EmailProcessor {
             user_id,
             user_account_access_id,
             email_address,
+            created_at: chrono::Utc::now(),
             processed_email_count: Arc::new(AtomicI64::new(0)),
             failed_email_count: Arc::new(AtomicI64::new(0)),
             email_client: Arc::new(email_client),
             token_count: Arc::new(AtomicI64::new(quota_used)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            failed: Arc::new(AtomicBool::new(false)),
-            http_client: server_state.http_client.clone(),
-            conn: server_state.conn.clone(),
-            rate_limiters: server_state.rate_limiters.clone(),
-            priority_queue: server_state.priority_queue.clone(),
+            http_client,
+            conn,
+            rate_limiters,
+            priority_queue,
+            user_email_rules: Arc::new(user_email_rules),
+            interrupt_channel,
         };
+
+        let clone = processor.clone();
+        tokio::spawn(async move {
+            clone.run().await.unwrap_or_else(|e| {
+                tracing::error!(
+                    "Error running email processor for {}: {:?}",
+                    clone.email_address,
+                    e
+                );
+            });
+        });
 
         Ok(processor)
     }
 
-    pub async fn from_email_address(
-        server_state: ServerState,
-        email_address: &str,
-    ) -> AppResult<Self> {
-        let user =
-            UserCtrl::get_with_account_access_and_usage_by_email(&server_state.conn, email_address)
-                .await?;
-
-        Self::new(server_state, user).await
-    }
-
-    pub async fn run(&self) -> AppResult<()> {
+    async fn run(&self) -> AppResult<()> {
         tracing::info!("Starting email processor for {}", self.email_address);
         match self.email_client.configure_labels_if_needed().await {
             Ok(true) => {
@@ -175,15 +180,14 @@ impl EmailProcessor {
             }
         };
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut rx = self.interrupt_channel.1.clone();
         loop {
-            interval.tick().await;
-
-            if self.is_cancelled() || self.is_quota_reached() {
+            tokio::select! {
+              _ = interval.tick() => {},
+              _ = rx.wait_for(|v| matches!(v, InterruptSignal::Cancel | InterruptSignal::Fail | InterruptSignal::Quota)) => {
+                tracing::info!("Interrupt signal received for {}", self.email_address);
                 break;
-            }
-
-            if self.is_failed() {
-                return Err(anyhow!("Processor failed").into());
+              }
             }
 
             if self
@@ -192,15 +196,11 @@ impl EmailProcessor {
                 == 0
             {
                 match self.queue_recent_emails().await {
-                    Ok(n) if n > 0 => {
-                        dbg!("Queued recent emails");
-                    }
+                    Ok(n) if n > 0 => {}
                     // If there are no recent emails and sufficient quota remaining, queue older emails in low priority
-                    Ok(_) if self.current_token_usage() < (*DAILY_QUOTA / 2) => {
+                    Ok(_) if self.current_token_usage() < *LOW_PRIORITY_CUTOFF => {
                         match self.queue_older_emails().await {
-                            Ok(_) => {
-                                dbg!("Queued older emails");
-                            }
+                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!(
                                     "Error queuing older emails for {}: {:?}",
@@ -229,19 +229,6 @@ impl EmailProcessor {
             self.email_address,
             self.status()
         );
-
-        Ok(())
-    }
-
-    pub async fn update_last_sync_time(&self) -> anyhow::Result<()> {
-        User::update(user::ActiveModel {
-            id: ActiveValue::Set(self.user_id),
-            last_sync: ActiveValue::Set(Some(chrono::Utc::now().into())),
-            ..Default::default()
-        })
-        .exec(&self.conn)
-        .await
-        .context("Error updating last sync time")?;
 
         Ok(())
     }
@@ -293,7 +280,6 @@ impl EmailProcessor {
         let mut next_page_token = None;
         while let Ok(resp) = load_page(next_page_token.clone()).await {
             next_page_token = resp.next_page_token.clone();
-            dbg!(&next_page_token);
 
             for id in resp
                 .messages
@@ -344,7 +330,7 @@ impl EmailProcessor {
 
     async fn queue_older_emails(&self) -> AppResult<i32> {
         let new_email_ids = self.fetch_email_ids(None).await?;
-        dbg!(&new_email_ids);
+
         if new_email_ids.is_empty() {
             return Ok(0);
         }
@@ -521,7 +507,7 @@ impl EmailProcessor {
             return;
         }
 
-        if *DAILY_QUOTA - self.current_token_usage() < 100_000 && priority == Priority::Low {
+        if self.current_token_usage() > *LOW_PRIORITY_CUTOFF && priority == Priority::Low {
             // Do not process low priority emails if quota is almost reached
             return;
         }
@@ -556,51 +542,14 @@ impl EmailProcessor {
         Ok(())
     }
 
-    pub async fn cleanup_emails(&self) -> anyhow::Result<i32> {
-        struct EmailIdWithCategory {
-            id: String,
-            category: String,
-        }
-
-        let cleanup_settings =
-            CleanupSettingsCtrl::get_user_cleanup_settings(&self.conn, self.user_id)
-                .await
-                .unwrap_or_default();
-
-        let categories_with_action = cleanup_settings
-            .iter()
-            .filter(|s| s.action != CleanupAction::Nothing)
-            .map(|s| s.category.clone())
-            .collect::<Vec<_>>();
-
-        let processed_email_ready_for_cleanup =
-            ProcessedEmailCtrl::get_processed_emails_for_cleanup(
-                &self.conn,
-                self.user_id,
-                Utc::now(),
-                categories_with_action,
-            )
-            .await
-            .context("Could not fetch processed emails ready for cleanup")?;
-
-        // let emails
-
-        // let tasks = email_ids.into_iter().map(parse_int_to_id).map(|id| {
-        //     tokio::spawn(async {
-        //         let action = cleanup_settings.iter().find(|s| s. category == );
-        //         self.email_client.delete_email(&id)
-        //     })
-        // });
-
-        unimplemented!()
-    }
-
     fn fail(&self) {
-        self.failed.store(true, Relaxed);
+        let (tx, _) = &self.interrupt_channel;
+        tx.send(InterruptSignal::Fail).unwrap();
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Relaxed);
+        let (tx, _) = &self.interrupt_channel;
+        tx.send(InterruptSignal::Cancel).unwrap();
     }
 
     fn set_token_count(&self, tokens: i64) {
@@ -612,7 +561,12 @@ impl EmailProcessor {
     }
 
     pub fn is_quota_reached(&self) -> bool {
-        self.token_count.load(Relaxed) >= *DAILY_QUOTA
+        let result = self.token_count.load(Relaxed) >= *DAILY_QUOTA;
+        if result {
+            let (tx, _) = &self.interrupt_channel;
+            tx.send(InterruptSignal::Quota).unwrap();
+        }
+        result
     }
 
     pub fn quota_remaining(&self) -> i64 {
@@ -640,11 +594,13 @@ impl EmailProcessor {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Relaxed)
+        let (_, rx) = &self.interrupt_channel;
+        matches!(*rx.borrow(), InterruptSignal::Cancel)
     }
 
     pub fn is_failed(&self) -> bool {
-        self.failed.load(Relaxed)
+        let (_, rx) = &self.interrupt_channel;
+        matches!(*rx.borrow(), InterruptSignal::Fail)
     }
 
     pub fn emails_remaining(&self) -> i64 {
@@ -690,7 +646,7 @@ impl EmailProcessor {
             emails_processed: self.total_emails_processed(),
             emails_failed: self.total_emails_failed(),
             emails_remaining: self.emails_remaining(),
-            num_in_processing: num_processing_lp + num_processing_hp,
+            total_emails: num_processing_lp + num_processing_hp,
             hp_emails: num_processing_hp,
             lp_emails: num_processing_lp,
             tokens_consumed: self.current_token_usage(),

@@ -3,6 +3,22 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(
+    rs_type = "String",
+    db_type = "Enum",
+    enum_name = "AssociatedEmailClientCategory"
+)]
+pub enum AssociatedEmailClientCategory {
+    #[sea_orm(string_value = "CATEGORY_PERSONAL")]
+    CategoryPersonal,
+    #[sea_orm(string_value = "CATEGORY_PROMOTIONS")]
+    CategoryPromotions,
+    #[sea_orm(string_value = "CATEGORY_SOCIAL")]
+    CategorySocial,
+    #[sea_orm(string_value = "CATEGORY_UPDATES")]
+    CategoryUpdates,
+}
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "cleanup_action")]
 pub enum CleanupAction {
     #[sea_orm(string_value = "ARCHIVE")]

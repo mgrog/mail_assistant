@@ -63,7 +63,7 @@ impl DailySummaryMailer {
             raw: Some(raw_email),
         };
 
-        email_client.insert_message(message).await?;
+        email_client.insert_email(message).await?;
 
         Ok(())
     }

@@ -1,8 +1,10 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
@@ -34,6 +36,9 @@ impl ActiveEmailProcessorMap {
         user: UserWithAccountAccessAndUsage,
     ) -> anyhow::Result<Arc<EmailProcessor>> {
         let user_email = user.email.clone();
+        let last_rule_update_time = user
+            .last_rule_update_time
+            .unwrap_or(DateTime::<Utc>::MIN_UTC.into());
 
         if let Some(processor) = self.active_processors.read().unwrap().get(&user_email) {
             match processor.status() {
@@ -45,6 +50,13 @@ impl ActiveEmailProcessorMap {
                 _ if processor.current_token_usage() != user.tokens_consumed => {
                     tracing::info!(
                         "Token usage has changed, recreating processor for {}",
+                        user_email
+                    );
+                    processor.cancel();
+                }
+                _ if processor.created_at < last_rule_update_time => {
+                    tracing::info!(
+                        "Rules have changed, recreating processor for {}",
                         user_email
                     );
                     processor.cancel();
@@ -62,21 +74,6 @@ impl ActiveEmailProcessorMap {
                 .map_err(|e| anyhow!("Could not create email processor {:?}", e))?,
         );
 
-        {
-            let proc = proc.clone();
-            let user_email = user_email.clone();
-            tokio::spawn(async move {
-                match proc.run().await {
-                    Ok(_) => {
-                        tracing::info!("Processor for {} finished", user_email);
-                    }
-                    Err(e) => {
-                        tracing::error!("Processor for {} failed: {:?}", user_email, e);
-                    }
-                };
-            });
-        }
-
         self.active_processors
             .write()
             .unwrap()
@@ -93,8 +90,7 @@ impl ActiveEmailProcessorMap {
             return None;
         }
 
-        let mut display_str = "Email Processing Queue Status:\n".to_string();
-        display_str.push_str(&format!("Active Processors:{}\n", active_processors.len()));
+        let mut display_str = format!("Active Processors:{}\n", active_processors.len());
 
         for (email, proc) in active_processors.iter() {
             let status = proc.get_current_state();
@@ -141,29 +137,6 @@ impl ActiveEmailProcessorMap {
             .values()
             .map(|p| p.total_emails_processed())
             .sum()
-    }
-
-    pub fn watch(&self) -> JoinHandle<()> {
-        let mut interval = interval(Duration::from_secs(5));
-        let mut now = std::time::Instant::now();
-        let mut last_recorded = 0;
-        let self_ = self.clone();
-        tokio::spawn(async move {
-            loop {
-                interval.tick().await;
-                let diff = self_.total_emails_processed() - last_recorded;
-                let emails_per_second = diff as f64 / now.elapsed().as_secs_f64();
-                now = std::time::Instant::now();
-                last_recorded = self_.total_emails_processed();
-                if let Some(update) = self_.get_current_state() {
-                    tracing::info!(
-                        "Processor Status Update:\n{email_per_second:.2} emails/s\n{update}",
-                        email_per_second = emails_per_second,
-                        update = update
-                    );
-                }
-            }
-        })
     }
 
     pub fn len(&self) -> usize {

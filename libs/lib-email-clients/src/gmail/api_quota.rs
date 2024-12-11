@@ -59,7 +59,7 @@ pub struct GmailApiQuota {
     pub watch: usize,
 }
 
-pub const GMAIL_QUOTA_PER_SECOND: usize = 250;
+pub const GMAIL_QUOTA_PER_SECOND: usize = 200;
 
 pub const GMAIL_API_QUOTA: GmailApiQuota = GmailApiQuota {
     drafts_create: 10,

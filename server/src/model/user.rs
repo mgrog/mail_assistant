@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{anyhow, Context};
 use chrono::DateTime;
 use lib_utils::crypt;
+use sea_orm::DbBackend;
 
 pub struct UserCtrl;
 
@@ -72,14 +73,14 @@ impl UserCtrl {
             .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
             .join(
                 JoinType::InnerJoin,
-                user::Relation::UserTokenUsageStats.def(),
+                user::Relation::UserTokenUsageStat.def(),
             )
             .column_as(user_account_access::Column::Id, "user_account_access_id")
             .column_as(user_account_access::Column::AccessToken, "access_token")
             .column_as(user_account_access::Column::RefreshToken, "refresh_token")
             .column_as(user_account_access::Column::ExpiresAt, "expires_at")
             .column_as(
-                user_token_usage_stats::Column::TokensConsumed,
+                user_token_usage_stat::Column::TokensConsumed,
                 "tokens_consumed",
             )
             .into_model::<UserWithAccountAccessAndUsage>()
@@ -112,36 +113,76 @@ impl UserCtrl {
     pub async fn all_with_available_quota(
         conn: &DatabaseConnection,
     ) -> AppResult<Vec<UserWithAccountAccessAndUsage>> {
-        let daily_quota = cfg.api.token_limits.daily_user_quota;
         let today = chrono::Utc::now().date_naive();
-        let users = User::find()
-            .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-            .filter(
-                Condition::any()
-                    .add(user_token_usage_stats::Column::TokensConsumed.lt(daily_quota as i64))
-                    .add(user_token_usage_stats::Column::TokensConsumed.is_null()),
-            )
-            .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
-            .join(
-                JoinType::LeftJoin,
-                user::Relation::UserTokenUsageStats
-                    .def()
-                    .on_condition(move |_left, right| {
-                        Condition::all().add(
-                            Expr::col((right, user_token_usage_stats::Column::Date))
-                                .eq(Expr::val(today)),
-                        )
-                    }),
-            )
-            .column_as(user_account_access::Column::Id, "user_account_access_id")
-            .column_as(user_account_access::Column::AccessToken, "access_token")
-            .column_as(user_account_access::Column::RefreshToken, "refresh_token")
-            .column_as(user_account_access::Column::ExpiresAt, "expires_at")
-            .column_as(
-                Expr::col(user_token_usage_stats::Column::TokensConsumed).if_null(0),
-                "tokens_consumed",
-            )
-            .into_model::<UserWithAccountAccessAndUsage>()
+        let daily_quota = cfg.api.token_limits.daily_user_quota as i64;
+
+        let raw_sql = r#"
+            SELECT
+                u.id,
+                u.email,
+                CAST(u.subscription_status AS text),
+                u.last_successful_payment_at,
+                u.last_payment_attempt_at,
+                u.created_at,
+                u.updated_at,
+                uaa.id AS user_account_access_id,
+                uaa.access_token,
+                uaa.refresh_token,
+                uaa.expires_at,
+                COALESCE("user_token_usage_stat".tokens_consumed, 0) AS tokens_consumed,
+                GREATEST(latest_email_rule_override.updated_at, latest_custom_email_rule.updated_at) AS last_rule_update_time
+            FROM
+                "user" AS u
+            JOIN
+                "user_account_access" AS uaa ON u.email = uaa.user_email
+            LEFT JOIN
+                "user_token_usage_stat" ON u.email = "user_token_usage_stat".user_email AND "user_token_usage_stat".date = $1::date
+            LEFT JOIN
+                (
+                    SELECT
+                        user_id,
+                        updated_at
+                    FROM
+                        (
+                            SELECT
+                                user_id,
+                                updated_at,
+                                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) AS row_num
+                            FROM
+                                default_email_rule_override
+                        ) AS subquery
+                    WHERE row_num = 1
+                ) AS latest_email_rule_override ON u.id = latest_email_rule_override.user_id
+            LEFT JOIN
+                (
+                    SELECT
+                        user_id,
+                        updated_at
+                    FROM
+                        (
+                            SELECT
+                                user_id,
+                                updated_at,
+                                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) AS row_num
+                            FROM
+                                custom_email_rule
+                        ) AS subquery
+                    WHERE row_num = 1
+                ) AS latest_custom_email_rule ON u.id = latest_custom_email_rule.user_id
+            WHERE
+                u.subscription_status = (CAST('ACTIVE' AS subscription_status))
+                AND ("user_token_usage_stat".tokens_consumed < $2 OR "user_token_usage_stat".tokens_consumed IS NULL)
+        "#;
+
+        let users =
+            UserWithAccountAccessAndUsage::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                raw_sql,
+                [
+                    today.format("%Y-%m-%d").to_string().into(),
+                    daily_quota.into(),
+                ],
+            ))
             .all(conn)
             .await
             .context("Error fetching users with available quota")?;
@@ -166,6 +207,10 @@ pub trait Id {
     fn id(&self) -> i32;
 }
 
+pub trait EmailAddress {
+    fn email(&self) -> &str;
+}
+
 pub trait AccountAccess {
     fn get_user_account_access_id(&self) -> i32;
     fn access_token(&self) -> anyhow::Result<String>;
@@ -183,7 +228,6 @@ pub struct UserWithAccountAccess {
     pub last_payment_attempt_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub last_sync: Option<DateTimeWithTimeZone>,
     pub user_account_access_id: i32,
     access_token: String,
     refresh_token: String,
@@ -193,6 +237,12 @@ pub struct UserWithAccountAccess {
 impl Id for UserWithAccountAccess {
     fn id(&self) -> i32 {
         self.id
+    }
+}
+
+impl EmailAddress for UserWithAccountAccess {
+    fn email(&self) -> &str {
+        &self.email
     }
 }
 
@@ -239,17 +289,23 @@ pub struct UserWithAccountAccessAndUsage {
     pub last_payment_attempt_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub last_sync: Option<DateTimeWithTimeZone>,
     pub user_account_access_id: i32,
     access_token: String,
     refresh_token: String,
     pub expires_at: DateTimeWithTimeZone,
     pub tokens_consumed: i64,
+    pub last_rule_update_time: Option<DateTimeWithTimeZone>,
 }
 
 impl Id for UserWithAccountAccessAndUsage {
     fn id(&self) -> i32 {
         self.id
+    }
+}
+
+impl EmailAddress for UserWithAccountAccessAndUsage {
+    fn email(&self) -> &str {
+        &self.email
     }
 }
 
@@ -354,15 +410,15 @@ mod tests {
 
         let query = User::find()
             .filter(user::Column::SubscriptionStatus.eq(SubscriptionStatus::Active))
-            .filter(user_token_usage_stats::Column::TokensConsumed.lt(daily_quota as i64))
+            .filter(user_token_usage_stat::Column::TokensConsumed.lt(daily_quota as i64))
             .join(JoinType::InnerJoin, user::Relation::UserAccountAccess.def())
             .join(
                 JoinType::InnerJoin,
-                user::Relation::UserTokenUsageStats.def(),
+                user::Relation::UserTokenUsageStat.def(),
             )
             .column_as(user_account_access::Column::Id, "user_account_access_id")
             .column_as(
-                user_token_usage_stats::Column::TokensConsumed,
+                user_token_usage_stat::Column::TokensConsumed,
                 "tokens_consumed",
             )
             .build(DbBackend::Postgres)

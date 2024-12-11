@@ -1,16 +1,5 @@
 extern crate google_gmail1 as gmail1;
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
 
-use crate::{
-    db_core::prelude::*,
-    model::{
-        labels,
-        user::{self, AccountAccess, Id},
-    },
-};
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use futures::future::join_all;
@@ -25,11 +14,19 @@ use mail_parser::MessageParser;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
+use std::sync::Arc;
+use std::{collections::HashSet, time::Duration};
 use strum::IntoEnumIterator;
 
 use crate::{
+    db_core::prelude::*,
     model::response::LabelUpdate,
+    model::{
+        labels,
+        user::{self, AccountAccess, EmailAddress, Id},
+    },
     server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
+    HttpClient,
 };
 
 macro_rules! gmail_url {
@@ -43,56 +40,18 @@ macro_rules! gmail_url {
     };
 }
 
-#[derive(Default)]
-/// Filter and paging options for message list
-pub struct MessageListOptions {
-    /// Messages more recent than this duration will be returned
-    pub more_recent_than: Option<chrono::Duration>,
-    pub categories: Option<Vec<String>>,
-    pub page_token: Option<String>,
-    pub max_results: Option<u32>,
-}
-
 const MAX_RESULTS_DEFAULT: u32 = 500;
-
-pub struct EmailClient {
-    http_client: reqwest::Client,
-    access_token: String,
-    rate_limiter: RateLimiter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmailMessage {
-    pub id: String,
-    pub label_ids: Vec<String>,
-    pub thread_id: String,
-    pub history_id: u64,
-    pub internal_date: i64,
-    pub from: Option<String>,
-    pub subject: Option<String>,
-    pub snippet: String,
-    pub body: Option<String>,
-}
-
-enum EmailClientError {
-    RateLimitExceeded,
-    Unauthorized,
-    BadRequest,
-    Unknown,
-}
-
-type EmailClientResult<T> = Result<T, EmailClientError>;
-
-// fn parse_gmail_response<T>(resp: reqwest::Response) -> EmailClientResult<T>
-// where
-//     T: serde::de::DeserializeOwned,
-// {
-//     let data = resp.json::<T>().await
-//     Ok(data)
-// }
 
 lazy_static! {
     static ref COLOR_MAP: Lazy<GmailLabelColorMap> = Lazy::new(GmailLabelColorMap::new);
+}
+
+#[derive(Debug, Clone)]
+pub struct EmailClient {
+    http_client: HttpClient,
+    access_token: String,
+    rate_limiter: Arc<RateLimiter>,
+    pub email_address: String,
 }
 
 // TODO: Migrate Gmail specific parts to libs/email_clients/gmail
@@ -100,13 +59,15 @@ impl EmailClient {
     pub async fn new(
         http_client: reqwest::Client,
         conn: DatabaseConnection,
-        mut user: impl AccountAccess + Id,
+        mut user: impl AccountAccess + Id + EmailAddress,
     ) -> anyhow::Result<EmailClient> {
-        let rate_limiter = RateLimiter::builder()
-            .initial(GMAIL_QUOTA_PER_SECOND)
-            .interval(Duration::from_secs(1))
-            .refill(GMAIL_QUOTA_PER_SECOND)
-            .build();
+        let rate_limiter = Arc::new(
+            RateLimiter::builder()
+                .initial(GMAIL_QUOTA_PER_SECOND)
+                .interval(Duration::from_secs(1))
+                .refill(GMAIL_QUOTA_PER_SECOND)
+                .build(),
+        );
 
         let access_token = user::get_new_token(&http_client, &conn, &mut user).await?;
 
@@ -127,21 +88,25 @@ impl EmailClient {
             http_client,
             access_token,
             rate_limiter,
+            email_address: user.email().to_string(),
         })
     }
 
     // This is only used to test a new client on authentication
     pub fn from_access_code(http_client: reqwest::Client, access_token: String) -> EmailClient {
-        let rate_limiter = RateLimiter::builder()
-            .initial(GMAIL_QUOTA_PER_SECOND)
-            .interval(Duration::from_secs(1))
-            .refill(GMAIL_QUOTA_PER_SECOND)
-            .build();
+        let rate_limiter = Arc::new(
+            RateLimiter::builder()
+                .initial(GMAIL_QUOTA_PER_SECOND)
+                .interval(Duration::from_secs(1))
+                .refill(GMAIL_QUOTA_PER_SECOND)
+                .build(),
+        );
 
         EmailClient {
             http_client,
             access_token,
             rate_limiter,
+            email_address: "test".to_string(),
         }
     }
 
@@ -182,9 +147,11 @@ impl EmailClient {
             .more_recent_than
             .map(|duration| format!("after:{}", (Utc::now() - duration).timestamp()));
 
-        let labels_filter = build_mailclerk_label_filter();
+        let label_filter = options
+            .label_filter
+            .unwrap_or(default_mailclerk_label_filter());
 
-        let mut filters = vec![labels_filter];
+        let mut filters = vec![label_filter];
         if let Some(time_filter) = time_filter {
             filters.push(time_filter);
         }
@@ -505,7 +472,7 @@ impl EmailClient {
         Ok(resp.json::<Profile>().await?)
     }
 
-    pub async fn insert_message(&self, message: Message) -> anyhow::Result<()> {
+    pub async fn insert_email(&self, message: Message) -> anyhow::Result<()> {
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_insert)
             .await;
@@ -519,13 +486,30 @@ impl EmailClient {
         Ok(())
     }
 
-    pub async fn delete_message(&self, message_id: &str) -> anyhow::Result<()> {
+    pub async fn trash_email(&self, message_id: &str) -> anyhow::Result<()> {
         self.rate_limiter
-            .acquire(GMAIL_API_QUOTA.messages_delete)
+            .acquire(GMAIL_API_QUOTA.messages_trash)
             .await;
         self.http_client
-            .delete(gmail_url!("messages", message_id))
+            .post(gmail_url!("messages", message_id, "trash"))
             .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn archive_email(&self, message_id: &str) -> anyhow::Result<()> {
+        self.rate_limiter
+            .acquire(GMAIL_API_QUOTA.messages_modify)
+            .await;
+        self.http_client
+            .post(gmail_url!("messages", message_id, "modify"))
+            .bearer_auth(&self.access_token)
+            .json(&json!({
+                "removeLabelIds": ["INBOX", "UNREAD"],
+                "addLabelIds": []
+            }))
             .send()
             .await?;
 
@@ -681,7 +665,7 @@ fn format_filter(label: &str) -> String {
     format!("label:Mailclerk/{}", label)
 }
 
-fn build_mailclerk_label_filter() -> String {
+fn default_mailclerk_label_filter() -> String {
     // Add mailclerk labels to filter
     let label_set = cfg
         .categories
@@ -701,9 +685,42 @@ fn build_mailclerk_label_filter() -> String {
     labels.join(" AND NOT ")
 }
 
+#[derive(Default)]
+/// Filter and paging options for message list
+pub struct MessageListOptions {
+    /// Default is any non-mailclerk label
+    pub label_filter: Option<String>,
+    /// Messages more recent than this duration will be returned
+    pub more_recent_than: Option<chrono::Duration>,
+    pub categories: Option<Vec<String>>,
+    pub page_token: Option<String>,
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailMessage {
+    pub id: String,
+    pub label_ids: Vec<String>,
+    pub thread_id: String,
+    pub history_id: u64,
+    pub internal_date: i64,
+    pub from: Option<String>,
+    pub subject: Option<String>,
+    pub snippet: String,
+    pub body: Option<String>,
+}
+
+enum EmailClientError {
+    RateLimitExceeded,
+    Unauthorized,
+    BadRequest,
+    Unknown,
+}
+
+type EmailClientResult<T> = Result<T, EmailClientError>;
+
 #[cfg(test)]
 mod tests {
-    use indexmap::Equivalent;
     use std::collections::HashSet;
     use strum::IntoEnumIterator;
 
@@ -829,7 +846,7 @@ mod tests {
     #[test]
     fn test_build_mailclerk_label_filter() {
         dotenvy::from_filename(".env.integration").unwrap();
-        let filter = super::build_mailclerk_label_filter();
+        let filter = super::default_mailclerk_label_filter();
 
         let expected = &cfg
             .categories

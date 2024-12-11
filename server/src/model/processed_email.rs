@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 
 use crate::{db_core::prelude::*, error::AppResult};
 
@@ -17,15 +17,15 @@ impl ProcessedEmailCtrl {
         Ok(processed_emails)
     }
 
-    pub async fn get_processed_emails_for_cleanup(
+    pub async fn get_users_processed_emails_for_cleanup(
         conn: &DatabaseConnection,
-        user_id: i32,
-        timestamp: chrono::DateTime<Utc>,
-        categories: Vec<String>,
+        cleanup_setting: &auto_cleanup_setting::Model,
     ) -> AppResult<Vec<ProcessedEmailIdCategoryAndTimestamp>> {
+        let user_id = cleanup_setting.user_id;
+        let timestamp = Utc::now() - Duration::days(cleanup_setting.after_days_old as i64);
         let processed_emails = ProcessedEmail::find()
             .filter(processed_email::Column::UserId.eq(user_id))
-            .filter(processed_email::Column::Category.is_in(categories))
+            .filter(processed_email::Column::Category.eq(&cleanup_setting.category))
             .filter(processed_email::Column::ProcessedAt.lt(timestamp))
             .select_only()
             .column(processed_email::Column::Id)
