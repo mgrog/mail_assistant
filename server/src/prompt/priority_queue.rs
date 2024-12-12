@@ -61,6 +61,8 @@ impl PromptPriorityQueue {
         let mut num_in_queue_by_email_address = self.num_in_queue_by_email_address.write().unwrap();
         let mut in_processing_set = self.in_processing_set.lock().unwrap();
 
+        // Check if the email is already in processing
+        // so emails are not processed multiple times
         if !in_processing_set.insert(email_id) {
             return false;
         }
@@ -123,6 +125,8 @@ impl PromptPriorityQueue {
         }
     }
 
+    // When a processor finishes processing an email, it should call this method
+    // to remove the email from the in_processing set
     pub fn remove_from_processing(&self, email_id: u128) {
         let mut in_processing_set = self.in_processing_set.lock().unwrap();
         in_processing_set.remove(&email_id);

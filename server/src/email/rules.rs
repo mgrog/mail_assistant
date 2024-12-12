@@ -22,6 +22,20 @@ lazy_static! {
             })
             .collect()
     };
+    pub static ref HEURISTIC_EMAIL_RULES: Vec<EmailRule> = {
+        use crate::server_config::cfg;
+        cfg.heuristics
+            .iter()
+            .map(|h| EmailRule {
+                prompt_content: h.from.clone(),
+                mail_label: h.mail_label.clone(),
+                associated_email_client_category: h.gmail_categories.first().map(|s| {
+                    AssociatedEmailClientCategory::try_from_value(s)
+                        .unwrap_or_else(|_| panic!("Invalid email client category: {s}"))
+                }),
+            })
+            .collect()
+    };
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +46,7 @@ pub struct EmailRule {
 }
 
 pub struct UserEmailRules {
-    pub category_rules: Vec<EmailRule>,
+    data: Vec<EmailRule>,
 }
 
 impl UserEmailRules {
@@ -49,10 +63,10 @@ impl UserEmailRules {
         let default_rule_overrides =
             default_rule_overrides.context("Failed to fetch default overrides")?;
         let custom_email_rules = custom_email_rules.context("Failed to fetch custom rules")?;
-        let category_rules =
+        let data =
             Self::build_category_rules(default_rule_overrides.clone(), custom_email_rules.clone());
 
-        Ok(Self { category_rules })
+        Ok(Self { data })
     }
 
     fn build_category_rules(
@@ -83,5 +97,17 @@ impl UserEmailRules {
         custom_rules
             .chain(default_rules.values().cloned())
             .collect()
+    }
+
+    pub fn data(&self) -> &[EmailRule] {
+        &self.data
+    }
+
+    pub fn get_custom_labels(&self) -> Vec<String> {
+        self.data.iter().map(|r| r.mail_label.clone()).collect()
+    }
+
+    pub fn get_prompt_categories(&self) -> Vec<String> {
+        self.data.iter().map(|r| r.prompt_content.clone()).collect()
     }
 }

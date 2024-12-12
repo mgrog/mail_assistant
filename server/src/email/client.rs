@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::{collections::HashSet, time::Duration};
 use strum::IntoEnumIterator;
 
+use crate::model::labels::UtilityLabels;
 use crate::{
     db_core::prelude::*,
     model::response::LabelUpdate,
@@ -25,9 +26,11 @@ use crate::{
         labels,
         user::{self, AccountAccess, EmailAddress, Id},
     },
-    server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY, UNKNOWN_CATEGORY},
+    server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY},
     HttpClient,
 };
+
+use super::rules::EmailRule;
 
 macro_rules! gmail_url {
     ($($params:expr),*) => {
@@ -267,7 +270,10 @@ impl EmailClient {
         }
     }
 
-    pub async fn configure_labels_if_needed(&self) -> anyhow::Result<bool> {
+    pub async fn configure_labels_if_needed(
+        &self,
+        user_custom_labels: Vec<String>,
+    ) -> anyhow::Result<bool> {
         let current_labels = self.get_labels().await?;
 
         let parent_label_exists = current_labels
@@ -290,8 +296,8 @@ impl EmailClient {
             .iter()
             .map(|c| c.mail_label.as_str())
             .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
-            .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
-            .chain(labels::CleanupLabels::iter().map(|c| c.as_str()))
+            .chain(labels::UtilityLabels::iter().map(|c| c.as_str()))
+            .chain(user_custom_labels.iter().map(|s| s.as_str()))
             .map(|mail_label| format!("Mailclerk/{}", mail_label))
             .collect::<HashSet<_>>();
 
@@ -350,7 +356,7 @@ impl EmailClient {
         // Add mailclerk labels
         let add_label_tasks = labels_to_add.into_iter().map(|label| {
             let (message_list_visibility, label_list_visibility) =
-                if label == UNKNOWN_CATEGORY.mail_label {
+                if label == UtilityLabels::Uncategorized.as_str() {
                     (Some("hide".to_string()), Some("labelHide".to_string()))
                 } else {
                     (
@@ -437,13 +443,13 @@ impl EmailClient {
         &self,
         email_id: String,
         current_labels: Vec<String>,
-        category: Category,
+        email_rule: EmailRule,
     ) -> anyhow::Result<LabelUpdate> {
         let user_labels = self.get_labels().await?;
         self.rate_limiter
             .acquire(GMAIL_API_QUOTA.messages_modify)
             .await;
-        let (json_body, update) = build_label_update(user_labels, current_labels, category)?;
+        let (json_body, update) = build_label_update(user_labels, current_labels, email_rule)?;
         let resp = self
             .http_client
             .post(gmail_url!("messages", &email_id, "modify"))
@@ -587,7 +593,7 @@ fn sanitize_message(msg: Message) -> anyhow::Result<EmailMessage> {
 fn build_label_update(
     user_labels: Vec<Label>,
     current_labels: Vec<String>,
-    category: Category,
+    email_rule: EmailRule,
 ) -> anyhow::Result<(serde_json::Value, LabelUpdate)> {
     static RE_CATEGORY_LABEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"CATEGORY_+").unwrap());
 
@@ -597,7 +603,10 @@ fn build_label_update(
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut categories_to_add = category.gmail_categories;
+    let categories_to_add = email_rule
+        .associated_email_client_category
+        .clone()
+        .map_or(Vec::new(), |c| vec![c.to_value()]);
 
     // Only remove categories if you have a different category to add
     let categories_to_remove = if categories_to_add.is_empty() {
@@ -614,20 +623,15 @@ fn build_label_update(
 
     let label_id = user_labels
         .iter()
-        .find(|l| l.name.as_ref() == Some(&format!("Mailclerk/{}", category.mail_label)))
+        .find(|l| l.name.as_ref() == Some(&format!("Mailclerk/{}", email_rule.mail_label)))
         .map(|l| l.id.clone().unwrap_or_default())
-        .context(format!("Could not find {}!", category.mail_label))?;
+        .context(format!("Could not find {}!", email_rule.mail_label))?;
 
     let (label_ids_to_add, label_names_applied) = {
         let mut label_ids = categories_to_add.clone();
         label_ids.push(label_id);
         let mut label_names = categories_to_add;
-        label_names.push(category.mail_label);
-
-        if category.important.unwrap_or(false) {
-            label_ids.push("IMPORTANT".to_string());
-            label_names.push("IMPORTANT".to_string());
-        }
+        label_names.push(email_rule.mail_label);
 
         (
             label_ids.into_iter().collect::<Vec<_>>(),
@@ -654,8 +658,7 @@ fn get_required_labels() -> HashSet<String> {
         .iter()
         .map(|c| c.mail_label.as_str())
         .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
-        .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
-        .chain(labels::CleanupLabels::iter().map(|c| c.as_str()))
+        .chain(labels::UtilityLabels::iter().map(|c| c.as_str()))
         .map(|mail_label| format!("Mailclerk/{}", mail_label))
         .collect::<HashSet<_>>()
 }
@@ -672,8 +675,7 @@ fn default_mailclerk_label_filter() -> String {
         .iter()
         .map(|c| c.mail_label.as_str())
         .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
-        .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
-        .chain(std::iter::once(UNKNOWN_CATEGORY.mail_label.as_str()))
+        .chain(labels::UtilityLabels::iter().map(|l| l.as_str()))
         .map(format_filter)
         .collect::<HashSet<String>>();
 
@@ -692,6 +694,7 @@ pub struct MessageListOptions {
     pub label_filter: Option<String>,
     /// Messages more recent than this duration will be returned
     pub more_recent_than: Option<chrono::Duration>,
+    pub older_than: Option<chrono::Duration>,
     pub categories: Option<Vec<String>>,
     pub page_token: Option<String>,
     pub max_results: Option<u32>,
@@ -726,11 +729,21 @@ mod tests {
 
     use google_gmail1::api::Label;
 
+    use super::*;
     use crate::{
         email::client::{format_filter, get_required_labels},
-        model::labels,
+        model::{labels, user::UserCtrl},
         server_config::cfg,
+        testing::common::setup,
     };
+
+    async fn setup_client(user_email: &str) -> EmailClient {
+        let (conn, http_client) = setup().await;
+        let user = UserCtrl::get_with_account_access_by_email(&conn, user_email)
+            .await
+            .unwrap();
+        EmailClient::new(http_client, conn, user).await.unwrap()
+    }
 
     #[test]
     fn test_gmail_url() {
@@ -753,11 +766,12 @@ mod tests {
         match super::build_label_update(
             user_labels,
             ["CATEGORY_SOCIAL".to_string()].to_vec(),
-            super::Category {
-                content: "Advertisment".to_string(),
+            super::EmailRule {
+                prompt_content: "Advertisment".to_string(),
                 mail_label: "mailclerk:ads".to_string(),
-                gmail_categories: vec!["CATEGORY_PROMOTIONS".to_string()],
-                important: None,
+                associated_email_client_category: Some(
+                    AssociatedEmailClientCategory::CategoryPromotions,
+                ),
             },
         ) {
             Ok((json_body, update)) => {
@@ -853,9 +867,7 @@ mod tests {
             .iter()
             .map(|c| c.mail_label.as_str())
             .chain(cfg.heuristics.iter().map(|c| c.mail_label.as_str()))
-            .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
-            .chain(std::iter::once(&*super::UNKNOWN_CATEGORY.mail_label))
-            .chain(labels::CleanupLabels::iter().map(|l| l.as_str()))
+            .chain(labels::UtilityLabels::iter().map(|l| l.as_str()))
             .map(format_filter)
             .chain(std::iter::once("label:inbox".to_string()))
             .collect::<HashSet<_>>();
@@ -869,5 +881,17 @@ mod tests {
         dbg!(&actual, "len: ", actual.len());
 
         assert!(expected.is_subset(&actual) && actual.is_subset(expected));
+    }
+
+    #[tokio::test]
+    async fn test_trash_email() {
+        let client = setup_client("mpgrospamacc@gmail.com").await;
+        client.trash_email("193936af5309bb57").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_archive_email() {
+        let client = setup_client("mpgrospamacc@gmail.com").await;
+        client.archive_email("193936af5309bb57").await.unwrap();
     }
 }

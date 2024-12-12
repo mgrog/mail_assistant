@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
-use crate::server_config::Category;
+use crate::server_config::UNKNOWN_CATEGORY;
 
 #[derive(Debug, Clone, Copy, EnumIter, Serialize, Deserialize)]
-pub enum CleanupLabels {
-    PendingDeletion,
-    PendingArchival,
+pub enum UtilityLabels {
+    Uncategorized,
+    Keep,
 }
 
-impl CleanupLabels {
+impl UtilityLabels {
     pub fn as_str(&self) -> &'static str {
         match self {
-            CleanupLabels::PendingDeletion => "pending deletion",
-            CleanupLabels::PendingArchival => "pending archival",
+            UtilityLabels::Uncategorized => UNKNOWN_CATEGORY.mail_label.as_str(),
+            UtilityLabels::Keep => "keep",
         }
     }
 }

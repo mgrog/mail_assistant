@@ -14,6 +14,7 @@ mod rate_limiters;
 mod request_tracing;
 mod routes;
 mod server_config;
+mod testing;
 
 use std::{
     env,
@@ -27,9 +28,7 @@ use std::{
 use auth::session_store::AuthSessionStore;
 use axum::{extract::FromRef, Router};
 use db_core::prelude::*;
-use email::{
-    active_email_processors::ActiveEmailProcessorMap, tasks::email_processing_map_cleanup,
-};
+use email::active_email_processors::ActiveEmailProcessorMap;
 use futures::future::join_all;
 use mimalloc::MiMalloc;
 use prompt::priority_queue::PromptPriorityQueue;
@@ -97,11 +96,6 @@ async fn main() -> anyhow::Result<()> {
         email_processing_map.clone(),
         state.rate_limiters.clone(),
     );
-    let processor_cleanup_handle = email_processing_map_cleanup(email_processing_map.clone());
-    let email_queue_processing_handle = email::tasks::run_email_processing_loop(
-        state.priority_queue.clone(),
-        email_processing_map.clone(),
-    );
 
     let mut scheduler = JobScheduler::new()
         .await
@@ -119,11 +113,58 @@ async fn main() -> anyhow::Result<()> {
             )?)
             .await?;
 
+        let queue = state.priority_queue.clone();
+        let map = email_processing_map.clone();
+        scheduler
+            .add(Job::new_one_shot(
+                Duration::from_secs(2),
+                move |_uuid, _l| {
+                    email::tasks::run_email_processing_loop(queue.clone(), map.clone());
+                },
+            )?)
+            .await?;
+
+        let queue = state.priority_queue.clone();
+        let map = email_processing_map.clone();
+        scheduler
+            .add(Job::new_one_shot(
+                chrono::Duration::minutes(30).to_std().unwrap(),
+                move |_uuid, _l| {
+                    email::tasks::run_email_processing_loop(queue.clone(), map.clone());
+                },
+            )?)
+            .await?;
+
         let state_clone = state.clone();
         let map = email_processing_map.clone();
         scheduler
             .add(Job::new_async("0 * * * * *", move |uuid, l| {
                 create_processors_for_users(uuid, l, state_clone.clone(), map.clone())
+            })?)
+            .await?;
+
+        let http_client = state.http_client.clone();
+        let conn = state.conn.clone();
+        scheduler
+            .add(Job::new_async("0 0 * * * *", move |uuid, mut l| {
+                let http_client = http_client.clone();
+                let conn = conn.clone();
+                Box::pin(async move {
+                    tracing::info!("Running auto cleanup job {}", uuid);
+                    match email::tasks::run_auto_email_cleanup(http_client, conn).await {
+                        Ok(_) => {
+                            tracing::info!("Auto cleanup job {} succeeded", uuid);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to run auto cleanup: {:?}", e);
+                        }
+                    }
+
+                    let next_tick = l.next_tick_for_job(uuid).await;
+                    if let Ok(Some(ts)) = next_tick {
+                        tracing::info!("Next time for auto cleanup job is {:?}", ts)
+                    }
+                })
             })?)
             .await?;
 
@@ -175,9 +216,6 @@ async fn main() -> anyhow::Result<()> {
         // inbox_subscription_handle,
         shutdown_handle,
         processing_watch_handle,
-        email_queue_processing_handle,
-        // process_emails_from_inbox_notifications_task,
-        processor_cleanup_handle,
     ])
     .await;
 
@@ -218,7 +256,7 @@ fn create_processors_for_users(
                 tracing::error!("Job failed: {:?}", e);
             }
         }
-        map.cleanup_stopped_processors();
+
         let next_tick = l.next_tick_for_job(uuid).await;
         if let Ok(Some(ts)) = next_tick {
             tracing::info!("Next time for processor creation job is {:?}", ts)

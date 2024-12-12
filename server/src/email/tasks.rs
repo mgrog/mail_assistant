@@ -1,31 +1,27 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use entity::processed_email;
 use entity::sea_orm_active_enums::{CleanupAction, SubscriptionStatus};
-use entity::{default_email_rule_override, processed_email, user};
-use futures::future::join_all;
-use sea_orm::{DatabaseConnection, JoinType};
+use google_gmail1::api::ListMessagesResponse;
+use sea_orm::DatabaseConnection;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use crate::db_core::prelude::*;
-use crate::email::rules::UserEmailRules;
 use crate::model::auto_cleanup_setting::AutoCleanupSettingCtrl;
-use crate::model::custom_email_rule::CustomEmailRuleCtrl;
 use crate::model::daily_email_summary::DailyEmailSentStatus;
-use crate::model::default_email_rule_override::DefaultEmailRuleOverrideCtrl;
 use crate::model::processed_email::ProcessedEmailCtrl;
 use crate::model::user::UserCtrl;
 use crate::prompt::priority_queue::PromptPriorityQueue;
 use crate::rate_limiters::RateLimiters;
 use crate::server_config::cfg;
-use crate::{email, HttpClient};
+use crate::HttpClient;
 use crate::{error::AppResult, ServerState};
 
 use super::active_email_processors::ActiveEmailProcessorMap;
-use super::client::EmailClient;
+use super::client::{EmailClient, MessageListOptions};
 use super::daily_summary_mailer::DailySummaryMailer;
 
 pub async fn add_users_to_processing(
@@ -84,18 +80,23 @@ pub async fn send_user_daily_email_summary(
     Ok(DailyEmailSentStatus::Sent)
 }
 
-pub fn email_processing_map_cleanup(map: ActiveEmailProcessorMap) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(30));
-
-        loop {
-            // -- DEBUG
-            // tracing::info!("Starting email processing map cleanup task");
-            // -- DEBUG
-            interval.tick().await;
-            map.cleanup_stopped_processors();
+async fn email_processing_task(
+    prompt_priority_queue: PromptPriorityQueue,
+    email_processor_map: ActiveEmailProcessorMap,
+) {
+    loop {
+        let entry = prompt_priority_queue.pop();
+        if let Some(entry) = entry {
+            let email = &entry.user_email;
+            let email_id = entry.email_id;
+            if let Some(processor) = email_processor_map.get(email) {
+                processor.process_email(email_id, entry.priority).await;
+                prompt_priority_queue.remove_from_processing(email_id);
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-    })
+    }
 }
 
 /// This function pulls emails from the prompt priority queue and sends them to the
@@ -109,32 +110,65 @@ pub fn run_email_processing_loop(
         "Starting email processing loop with {} threads...",
         max_threads
     );
-    let handles = (0..max_threads).map(move |_| {
-        let prompt_priority_queue = prompt_priority_queue.clone();
-        let email_processor_map = email_processor_map.clone();
-        tokio::spawn(async move {
-            loop {
-                let entry = prompt_priority_queue.pop();
-                if let Some(entry) = entry {
-                    let email = &entry.user_email;
-                    let email_id = entry.email_id;
-                    if let Some(processor) = email_processor_map.get(email) {
-                        processor.process_email(email_id, entry.priority).await;
-                        prompt_priority_queue.remove_from_processing(email_id);
-                    }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        })
-    });
+
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for _ in 0..max_threads {
+        join_set.spawn(email_processing_task(
+            prompt_priority_queue.clone(),
+            email_processor_map.clone(),
+        ));
+    }
 
     tokio::task::spawn(async move {
-        for result in join_all(handles).await {
-            if let Err(err) = result {
-                tracing::error!("Email processing loop error: {:?}", err);
-                panic!("Email processing loop panicked!");
+        loop {
+            if join_set.len() != max_threads {
+                tracing::error!(
+                    "Email processing thread count mismatch: expected {}, got {}",
+                    max_threads,
+                    join_set.len()
+                );
+
+                join_set.abort_all();
+
+                tracing::info!("Restarting email processing threads...");
+
+                for _ in 0..max_threads {
+                    join_set.spawn(email_processing_task(
+                        prompt_priority_queue.clone(),
+                        email_processor_map.clone(),
+                    ));
+                }
             }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+pub fn run_processor_cleanup_loop(
+    prompt_priority_queue: PromptPriorityQueue,
+    email_processor_map: ActiveEmailProcessorMap,
+) -> JoinHandle<()> {
+    let mut interval = interval(
+        (chrono::Duration::minutes(30) + chrono::Duration::seconds(5))
+            .to_std()
+            .unwrap(),
+    );
+    tokio::spawn(async move {
+        loop {
+            interval.tick().await;
+            let processors_for_cleanup = email_processor_map
+                .entries()
+                .into_iter()
+                .filter(|(email, processor)| {
+                    processor.has_stopped_queueing()
+                        && prompt_priority_queue.num_in_queue(email) == 0
+                })
+                .map(|e| e.0)
+                .collect::<HashSet<_>>();
+
+            email_processor_map.cleanup_processors(processors_for_cleanup);
         }
     })
 }
@@ -167,7 +201,53 @@ async fn get_email_client(
     Ok(client)
 }
 
-pub async fn run_auto_cleanup(
+async fn get_all_message_ids_with_keep_label(
+    email_client: EmailClient,
+) -> anyhow::Result<HashSet<String>> {
+    let mut message_ids_with_keep_label = HashSet::new();
+    let load_page = |next_page_token: Option<String>| async {
+        let resp = email_client
+            .get_message_list(MessageListOptions {
+                page_token: next_page_token,
+                label_filter: Some(
+                    [
+                        "label:inbox".to_string(),
+                        "label:Mailclerk/keep".to_string(),
+                    ]
+                    .join(" AND "),
+                ),
+                ..Default::default()
+            })
+            .await
+            .context("Error loading next keep label email page")?;
+
+        Ok::<_, anyhow::Error>(resp)
+    };
+
+    let mut next_page_token = None;
+    while let ListMessagesResponse {
+        messages: Some(messages),
+        next_page_token: next_token_resp,
+        ..
+    } = load_page(next_page_token.clone()).await?
+    {
+        next_page_token = next_token_resp;
+
+        for message in messages {
+            if let Some(id) = message.id {
+                message_ids_with_keep_label.insert(id);
+            }
+        }
+
+        if next_page_token.is_none() {
+            break;
+        }
+    }
+
+    Ok(message_ids_with_keep_label)
+}
+
+pub async fn run_auto_email_cleanup(
     http_client: HttpClient,
     conn: DatabaseConnection,
 ) -> anyhow::Result<()> {
@@ -199,6 +279,8 @@ pub async fn run_auto_cleanup(
             }
         };
 
+        let keep_ids = Arc::new(get_all_message_ids_with_keep_label(email_client.clone()).await?);
+
         for setting in settings {
             if let Ok(emails_to_cleanup) =
                 ProcessedEmailCtrl::get_users_processed_emails_for_cleanup(&conn, &setting).await
@@ -206,6 +288,7 @@ pub async fn run_auto_cleanup(
                 if emails_to_cleanup.is_empty() {
                     continue;
                 }
+
                 tracing::info!(
                     "Cleaning up {} emails for user {} according to setting:\n{:?}",
                     emails_to_cleanup.len(),
@@ -213,7 +296,12 @@ pub async fn run_auto_cleanup(
                     setting
                 );
 
-                let queue = Arc::new(Mutex::new(emails_to_cleanup));
+                let queue = Arc::new(Mutex::new(
+                    emails_to_cleanup
+                        .into_iter()
+                        .filter(|email| !keep_ids.contains(&email.id))
+                        .collect::<Vec<_>>(),
+                ));
 
                 let threads = (0..5)
                     .map(|_| {
@@ -227,35 +315,35 @@ pub async fn run_auto_cleanup(
                                     CleanupAction::Nothing => {}
                                     CleanupAction::Delete => {
                                         // -- DEBUG
-                                        println!("Trashing email {:?}", email);
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
+                                        // println!("Trashing email {:?}", email);
+                                        // tokio::time::sleep(Duration::from_millis(10)).await;
                                         // -- DEBUG
-                                        // email_client.trash_email(&email.id).await.unwrap_or_else(
-                                        //     |e| {
-                                        //         tracing::error!(
-                                        //             "Failed to trash email {} for user {}: {:?}",
-                                        //             email.id,
-                                        //             email_client.email_address,
-                                        //             e
-                                        //         )
-                                        //     },
-                                        // );
+                                        email_client.trash_email(&email.id).await.unwrap_or_else(
+                                            |e| {
+                                                tracing::error!(
+                                                    "Failed to trash email {} for user {}: {:?}",
+                                                    email.id,
+                                                    email_client.email_address,
+                                                    e
+                                                )
+                                            },
+                                        );
                                     }
                                     CleanupAction::Archive => {
                                         // -- DEBUG
-                                        println!("Archiving email: {:?}", email);
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
+                                        // println!("Archiving email: {:?}", email);
+                                        // tokio::time::sleep(Duration::from_millis(10)).await;
                                         // -- DEBUG
-                                        // email_client.archive_email(&email.id).await.unwrap_or_else(
-                                        //     |e| {
-                                        //         tracing::error!(
-                                        //             "Failed to archive email {} for user {}: {:?}",
-                                        //             email.id,
-                                        //             email_client.email_address,
-                                        //             e
-                                        //         )
-                                        //     },
-                                        // );
+                                        email_client.archive_email(&email.id).await.unwrap_or_else(
+                                            |e| {
+                                                tracing::error!(
+                                                    "Failed to archive email {} for user {}: {:?}",
+                                                    email.id,
+                                                    email_client.email_address,
+                                                    e
+                                                )
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -302,6 +390,12 @@ pub fn watch(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::testing::common::setup;
+
     #[tokio::test]
-    async fn test_auto_cleanup() {}
+    async fn test_auto_cleanup() {
+        let (conn, http_client) = setup().await;
+        run_auto_email_cleanup(http_client, conn).await.unwrap();
+    }
 }

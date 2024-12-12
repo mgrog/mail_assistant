@@ -34,6 +34,13 @@ pub struct Category {
     pub important: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Heuristic {
+    pub from: String,
+    pub mail_label: String,
+    pub gmail_categories: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
@@ -75,7 +82,7 @@ struct ConfigFile {
     settings: Settings,
     api: ApiConfig,
     categories: Vec<Category>,
-    heuristics: Vec<Category>,
+    heuristics: Vec<Heuristic>,
     model: ModelConfig,
 }
 
@@ -84,7 +91,7 @@ pub struct ServerConfig {
     pub settings: Settings,
     pub api: ApiConfig,
     pub categories: Vec<Category>,
-    pub heuristics: Vec<Category>,
+    pub heuristics: Vec<Heuristic>,
     pub gmail_config: GmailConfig,
     pub model: ModelConfig,
     pub frontend_url: Url,
@@ -103,7 +110,7 @@ impl std::fmt::Display for ServerConfig {
                 .collect::<Vec<_>>().join("\n"),
                 self.heuristics
                 .iter()
-                .map(|c| format!("{} -> {}", c.content, c.mail_label))
+                .map(|c| format!("{} -> {}", c.from, c.mail_label))
                 .collect::<Vec<_>>().join("\n"),
             self.gmail_config,
             self.model,

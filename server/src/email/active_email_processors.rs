@@ -1,17 +1,13 @@
-use std::sync::atomic::AtomicU64;
+use std::collections::HashSet;
 use std::sync::RwLock;
-use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use tokio::task::JoinHandle;
-use tokio::time::interval;
-
-use crate::model::user::UserWithAccountAccessAndUsage;
-use crate::ServerState;
 
 use crate::email::processor::EmailProcessor;
+use crate::model::user::UserWithAccountAccessAndUsage;
+use crate::ServerState;
 
 use super::processor::ProcessorStatus;
 
@@ -100,15 +96,20 @@ impl ActiveEmailProcessorMap {
         Some(display_str)
     }
 
-    pub fn cleanup_stopped_processors(&self) {
-        self.active_processors.write().unwrap().retain(|_, proc| {
-            !matches!(
-                proc.status(),
-                ProcessorStatus::Cancelled
-                    | ProcessorStatus::Failed
-                    | ProcessorStatus::QuotaExceeded
-            )
-        });
+    pub fn entries(&self) -> Vec<(String, Arc<EmailProcessor>)> {
+        self.active_processors
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    pub fn cleanup_processors(&self, set: HashSet<String>) {
+        self.active_processors
+            .write()
+            .unwrap()
+            .retain(|_, proc| !set.contains(&proc.email_address));
 
         self.get_current_state();
     }

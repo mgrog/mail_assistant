@@ -1,12 +1,12 @@
 use anyhow::anyhow;
 use anyhow::Context;
-use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::email::rules::UserEmailRules;
 use crate::rate_limiters;
 use crate::HttpClient;
 use crate::{
@@ -15,41 +15,23 @@ use crate::{
     server_config::cfg,
 };
 
-lazy_static! {
-    static ref SYSTEM_PROMPT: String = format!(
-        "r#
-    You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.
-    [{}]
-    You should try to choose a single category from the above, along with its confidence score. 
-    You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.
-
-    #", get_ai_categories().join(", "));
-}
-
 const AI_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
 
-fn get_system_prompt() -> String {
-    const SYSTEM_INTRO: &str = "You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.";
-    const SYSTEM_OUTRO: &str = concat!(
-    "You should try to choose a single category from the above, along with its confidence score.",
-    "You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.");
-
+fn system_prompt(prompt_categories: Vec<String>) -> String {
     format!(
-        "{}\n{}\n{}",
-        SYSTEM_INTRO,
-        get_ai_categories().join(", "),
-        SYSTEM_OUTRO
+        "r#You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.
+        [{}]
+        You should try to choose a single category from the above, along with its confidence score. 
+        You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.#",
+        prompt_categories.join(", ")
     )
-}
-
-fn get_ai_categories() -> Vec<String> {
-    cfg.categories.iter().map(|c| c.content.clone()).collect()
 }
 
 pub async fn send_category_prompt(
     http_client: &HttpClient,
     rate_limiters: &rate_limiters::RateLimiters,
     email_message: &EmailMessage,
+    email_rules: &UserEmailRules,
 ) -> AppResult<CategoryPromptResponse> {
     let subject = email_message.subject.as_ref().map_or("", |s| s.as_str());
     let body = email_message.body.as_ref().map_or("", |s| s.as_str());
@@ -65,7 +47,7 @@ pub async fn send_category_prompt(
             "messages": [
               {
                 "role": "system",
-                "content": *SYSTEM_PROMPT
+                "content": system_prompt(email_rules.get_prompt_categories())
               },
               {
                 "role": "user",

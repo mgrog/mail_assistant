@@ -135,8 +135,7 @@ impl GmailLabelColorMap {
         reserved.insert("orders".to_string(), get_color("blue-green"));
         reserved.insert("social media".to_string(), get_color("mint-200"));
         reserved.insert("career networking".to_string(), get_color("straw-500"));
-        reserved.insert("pending archival".to_string(), get_color("rose-600"));
-        reserved.insert("pending deletion".to_string(), get_color("red-600"));
+        reserved.insert("keep".to_string(), get_color("forest-700"));
 
         let unreserved = GMAIL_LABEL_COLORS
             .iter()
