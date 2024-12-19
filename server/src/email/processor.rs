@@ -19,7 +19,8 @@ use tokio::sync::watch;
 
 use crate::{
     email::{
-        client::{EmailClient, EmailMessage, MessageListOptions},
+        client::{EmailClient, MessageListOptions},
+        parsed_message::ParsedMessage,
         rules::UserEmailRules,
     },
     error::{extract_database_error_code, AppError, AppResult, DatabaseErrorCode},
@@ -330,7 +331,7 @@ impl EmailProcessor {
 
     async fn parse_and_prompt_email(
         &self,
-        email_message: &EmailMessage,
+        email_message: &ParsedMessage,
     ) -> anyhow::Result<PromptReturnData> {
         let CategoryPromptResponse {
             category: ai_answer,
@@ -382,7 +383,7 @@ impl EmailProcessor {
 
     async fn record_email_for_training(
         &self,
-        email_message: &EmailMessage,
+        email_message: &ParsedMessage,
         parse_and_prompt_return: &PromptReturnData,
     ) -> anyhow::Result<()> {
         let PromptReturnData {
@@ -423,7 +424,7 @@ impl EmailProcessor {
 
     async fn categorize_email_in_client(
         &self,
-        email_message: &EmailMessage,
+        email_message: &ParsedMessage,
         email_rule: EmailRule,
     ) -> anyhow::Result<LabelUpdate> {
         let label_update = match self
@@ -457,7 +458,7 @@ impl EmailProcessor {
 
     async fn record_processed_email(
         &self,
-        email_message: &EmailMessage,
+        email_message: &ParsedMessage,
         data: EmailProcessingData,
     ) -> anyhow::Result<()> {
         match ProcessedEmailCtrl::insert(
@@ -493,11 +494,12 @@ impl EmailProcessor {
 
         let email_message = self
             .email_client
-            .get_sanitized_message(&email_id)
+            .get_parsed_message(&email_id)
             .await
             .context("Failed to fetch email")?;
 
         self.rate_limiters.acquire_one().await;
+
         let result = self.parse_and_prompt_email(&email_message).await?;
         if cfg.settings.training_mode {
             match self

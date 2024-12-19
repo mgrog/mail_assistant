@@ -105,17 +105,25 @@ impl PromptPriorityQueue {
                 self.num_in_queue_by_email_address.write().unwrap();
 
             if let Some(count) = num_in_queue_by_email_address.get_mut(&entry.user_email) {
-                match (count.high_priority, count.low_priority) {
-                    (0, 0) => {
-                        num_in_queue_by_email_address.remove(&entry.user_email);
+                match entry.priority {
+                    Priority::High => {
+                        count.high_priority =
+                            count.high_priority.checked_sub(1).unwrap_or_else(|| {
+                                tracing::error!("Detected negative high priority count");
+                                0
+                            });
                     }
-                    _ => {
-                        if entry.priority == Priority::High {
-                            count.high_priority -= 1;
-                        } else {
-                            count.low_priority -= 1;
-                        }
+                    Priority::Low => {
+                        count.low_priority =
+                            count.low_priority.checked_sub(1).unwrap_or_else(|| {
+                                tracing::error!("Detected negative low priority count");
+                                0
+                            });
                     }
+                }
+                // Cleanup entry when counts are 0
+                if count.high_priority == 0 && count.low_priority == 0 {
+                    num_in_queue_by_email_address.remove(&entry.user_email);
                 }
             }
 

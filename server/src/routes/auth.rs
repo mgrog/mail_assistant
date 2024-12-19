@@ -3,9 +3,10 @@ extern crate google_gmail1 as gmail;
 use crate::{
     auth::{jwt::generate_redirect_auth_headers, session_store::AuthSessionStore},
     db_core::prelude::*,
+    model::user::UserCtrl,
 };
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     response::{IntoResponse, Redirect},
     Json,
 };
@@ -210,6 +211,7 @@ pub async fn handler_auth_gmail_callback(
             url.path_segments_mut()
                 .unwrap()
                 .push(CONFIRM_CONNECTION_PATH);
+
             return Ok((headers, Redirect::to(url.as_str())).into_response());
         }
         // Need to handle this case by logging user in with google oauth2 jwt
@@ -230,6 +232,19 @@ pub async fn handler_auth_gmail_callback(
 pub async fn handler_auth_token_callback() -> AppJsonResult<serde_json::Value> {
     Ok(Json(json!({
         "message": "Login success"
+    })))
+}
+
+pub async fn handler_refresh_user_token(
+    user_email: Path<String>,
+    State(http_client): State<HttpClient>,
+    State(conn): State<DatabaseConnection>,
+) -> AppJsonResult<serde_json::Value> {
+    let mut user = UserCtrl::get_with_account_access_by_email(&conn, user_email.as_str()).await?;
+    crate::model::user::get_new_token(&http_client, &conn, &mut user).await?;
+
+    Ok(Json(json!({
+        "message": "Token refreshed"
     })))
 }
 

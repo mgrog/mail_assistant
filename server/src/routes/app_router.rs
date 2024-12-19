@@ -24,6 +24,10 @@ impl AppRouter {
                 "/check_account_connection",
                 get(account_connection::check_account_connection),
             )
+            .route(
+                "/refresh_user_token/:user_email",
+                get(auth::handler_refresh_user_token),
+            )
             .layer(request_tracing::trace_with_request_id_layer())
             .layer(CorsLayer::permissive())
             .layer(CookieManagerLayer::new())

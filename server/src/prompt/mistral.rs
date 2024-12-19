@@ -1,16 +1,17 @@
 use anyhow::anyhow;
 use anyhow::Context;
+use indoc::formatdoc;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::email::parsed_message::ParsedMessage;
 use crate::email::rules::UserEmailRules;
 use crate::rate_limiters;
 use crate::HttpClient;
 use crate::{
-    email::client::EmailMessage,
     error::{AppError, AppResult},
     server_config::cfg,
 };
@@ -18,19 +19,18 @@ use crate::{
 const AI_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
 
 fn system_prompt(prompt_categories: Vec<String>) -> String {
-    format!(
-        "r#You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.
-        [{}]
-        You should try to choose a single category from the above, along with its confidence score. 
-        You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.#",
-        prompt_categories.join(", ")
-    )
+    formatdoc! {r#"
+        You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.
+        [{categories}]
+        You should try to choose a single category from the above, along with its confidence score.
+        You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories."#, 
+    categories = prompt_categories.join(", ")}
 }
 
 pub async fn send_category_prompt(
     http_client: &HttpClient,
     rate_limiters: &rate_limiters::RateLimiters,
-    email_message: &EmailMessage,
+    email_message: &ParsedMessage,
     email_rules: &UserEmailRules,
 ) -> AppResult<CategoryPromptResponse> {
     let subject = email_message.subject.as_ref().map_or("", |s| s.as_str());
@@ -216,4 +216,53 @@ pub struct ChatApiError {
 pub enum ChatApiResponseOrError {
     Response(ChatApiResponse),
     Error(ChatApiError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        email::{parsed_message::ParsedMessage, rules::EmailRule},
+        testing::common::setup_email_client,
+    };
+
+    #[test]
+    fn test_system_prompt() {
+        let prompt_categories = vec!["category1".to_string(), "category2".to_string()];
+        let expected = concat!(
+            "You are a helpful assistant that can categorize emails such as the categories inside the square brackets below.\n",
+        "[category1, category2]\n",
+        "You should try to choose a single category from the above, along with its confidence score.\n",
+        "You will only respond with a JSON object with the keys category and confidence. Do not provide explanations or multiple categories.",
+        );
+
+        assert_eq!(system_prompt(prompt_categories), expected);
+    }
+
+    #[tokio::test]
+    async fn test_send_category_prompt_custom_rule() {
+        let http_client = HttpClient::new();
+        let rate_limiters = rate_limiters::RateLimiters::new(10_000, 1_000, 1);
+        let email_client = setup_email_client("mpgrospamacc@gmail.com").await;
+        let gmail_msg = email_client
+            .get_message_by_id("192b150bc2c64ac5")
+            .await
+            .unwrap();
+
+        let msg = ParsedMessage::from_gmail_message(gmail_msg).unwrap();
+
+        let test_content = "Seat Geek Upcoming Events".to_string();
+
+        let email_rules = UserEmailRules::new_with_default_rules(vec![EmailRule {
+            prompt_content: test_content.clone(),
+            mail_label: "seatgeek".to_string(),
+            associated_email_client_category: None,
+        }]);
+
+        let resp = send_category_prompt(&http_client, &rate_limiters, &msg, &email_rules)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.category, test_content);
+    }
 }

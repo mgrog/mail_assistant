@@ -130,13 +130,14 @@ async fn main() -> anyhow::Result<()> {
             .add(Job::new_one_shot(
                 chrono::Duration::minutes(30).to_std().unwrap(),
                 move |_uuid, _l| {
-                    email::tasks::run_email_processing_loop(queue.clone(), map.clone());
+                    email::tasks::run_processor_cleanup_loop(queue.clone(), map.clone());
                 },
             )?)
             .await?;
 
         let state_clone = state.clone();
         let map = email_processing_map.clone();
+        // Start of every minute, create processors for active users
         scheduler
             .add(Job::new_async("0 * * * * *", move |uuid, l| {
                 create_processors_for_users(uuid, l, state_clone.clone(), map.clone())
@@ -145,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
 
         let http_client = state.http_client.clone();
         let conn = state.conn.clone();
+        // Start of every hour, run auto email cleanup
         scheduler
             .add(Job::new_async("0 0 * * * *", move |uuid, mut l| {
                 let http_client = http_client.clone();
@@ -188,6 +190,13 @@ async fn main() -> anyhow::Result<()> {
         })
     }));
 
+    if env::var("SERVER_ONLY").map_or(false, |v| v == "true") {
+        tracing::info!("-------- RUNNING SERVER ONLY --------");
+        // Handle Ctrl+C
+        join_all([run_server(router, scheduler)]).await;
+        return Ok(());
+    }
+
     match scheduler.start().await {
         Ok(_) => {
             tracing::info!("Scheduler started");
@@ -197,24 +206,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Handle Ctrl+C
-    let shutdown_handle = {
-        tokio::spawn(async move {
-            if env::var("NO_SHUTDOWN").unwrap_or("false".to_string()) == "true" {
-                return;
-            }
-            signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-            tracing::info!("Received Ctrl+C, shutting down");
-            scheduler.shutdown().await.unwrap();
-            println!("Cleanups done, shutting down");
-            std::process::exit(0);
-        })
-    };
-
     join_all(vec![
-        run_server(router),
+        run_server(router, scheduler),
         // inbox_subscription_handle,
-        shutdown_handle,
         processing_watch_handle,
     ])
     .await;
@@ -222,7 +216,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_server(router: Router) -> JoinHandle<()> {
+async fn shutdown_signal(mut scheduler: JobScheduler) {
+    if env::var("NO_SHUTDOWN").unwrap_or("false".to_string()) == "true" {
+        return;
+    }
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            scheduler.shutdown().await.unwrap();
+            println!("Cleanups done, shutting down");
+
+        },
+        _ = terminate => {
+            scheduler.shutdown().await.unwrap();
+            println!("Cleanups done, shutting down");
+        },
+    }
+}
+
+fn run_server(router: Router, scheduler: JobScheduler) -> JoinHandle<()> {
     tokio::spawn(async {
         // Start the server
         let port = env::var("PORT").unwrap_or("5006".to_string());
@@ -234,7 +263,10 @@ fn run_server(router: Router) -> JoinHandle<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port.parse::<u16>().unwrap()));
         tracing::debug!("listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal(scheduler))
+            .await
+            .unwrap();
     })
 }
 

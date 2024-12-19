@@ -536,7 +536,7 @@ dependencies = [
  "connection-string",
  "either",
  "enumflags2",
- "indoc",
+ "indoc 1.0.9",
  "lsp-types",
  "once_cell",
  "psl-core",
@@ -1118,7 +1118,7 @@ version = "0.1.0"
 source = "git+https://github.com/Brendonovich/prisma-engines?tag=pcr-0.6.10#c4aeef82dbae310e974d6122160c7e3b5fb6df53"
 dependencies = [
  "colored",
- "indoc",
+ "indoc 1.0.9",
  "pest",
 ]
 
@@ -1213,7 +1213,7 @@ dependencies = [
  "cuid",
  "either",
  "enumflags2",
- "indoc",
+ "indoc 1.0.9",
  "prisma-value",
  "psl-core",
  "schema-ast",
@@ -2451,6 +2451,12 @@ name = "indoc"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa799dd5ed20a7e349f3b4639aa80d74549c81716d9ec4f994c9b5815598306"
+
+[[package]]
+name = "indoc"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b248f5224d1d606005e02c97f5aa4e88eeb230488bcc03bc9ca4d7991399f2b5"
 
 [[package]]
 name = "inherent"
@@ -3920,7 +3926,7 @@ dependencies = [
  "chrono",
  "diagnostics",
  "enumflags2",
- "indoc",
+ "indoc 1.0.9",
  "itertools 0.10.5",
  "lsp-types",
  "once_cell",
@@ -5030,6 +5036,7 @@ dependencies = [
  "html2text",
  "http 1.1.0",
  "indexmap 2.6.0",
+ "indoc 2.0.5",
  "jsonwebtoken",
  "lazy_static",
  "leaky-bucket",
@@ -6448,7 +6455,7 @@ version = "0.1.0"
 source = "git+https://github.com/Brendonovich/prisma-engines?tag=pcr-0.6.10#c4aeef82dbae310e974d6122160c7e3b5fb6df53"
 dependencies = [
  "backtrace",
- "indoc",
+ "indoc 1.0.9",
  "quaint",
  "serde",
  "serde_json",

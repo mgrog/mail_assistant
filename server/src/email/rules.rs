@@ -50,6 +50,20 @@ pub struct UserEmailRules {
 }
 
 impl UserEmailRules {
+    pub fn new(email_rules: Vec<EmailRule>) -> Self {
+        Self { data: email_rules }
+    }
+
+    pub fn new_with_default_rules(email_rules: Vec<EmailRule>) -> Self {
+        let rules = email_rules
+            .iter()
+            .chain(DEFAULT_EMAIL_RULES.iter())
+            .cloned()
+            .collect();
+
+        Self::new(rules)
+    }
+
     pub async fn from_user(conn: &DatabaseConnection, user_id: i32) -> anyhow::Result<Self> {
         // let user_defined = None;
         let (default_rule_overrides, custom_email_rules) = join!(
@@ -66,7 +80,7 @@ impl UserEmailRules {
         let data =
             Self::build_category_rules(default_rule_overrides.clone(), custom_email_rules.clone());
 
-        Ok(Self { data })
+        Ok(Self::new(data))
     }
 
     fn build_category_rules(

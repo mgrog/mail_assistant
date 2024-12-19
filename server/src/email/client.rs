@@ -10,7 +10,6 @@ use lazy_static::lazy_static;
 use leaky_bucket::RateLimiter;
 use lib_email_clients::gmail::api_quota::{GMAIL_API_QUOTA, GMAIL_QUOTA_PER_SECOND};
 use lib_email_clients::gmail::label_colors::GmailLabelColorMap;
-use mail_parser::MessageParser;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
@@ -26,10 +25,11 @@ use crate::{
         labels,
         user::{self, AccountAccess, EmailAddress, Id},
     },
-    server_config::{cfg, Category, DAILY_SUMMARY_CATEGORY},
+    server_config::{cfg, DAILY_SUMMARY_CATEGORY},
     HttpClient,
 };
 
+use super::parsed_message::ParsedMessage;
 use super::rules::EmailRule;
 
 macro_rules! gmail_url {
@@ -197,9 +197,9 @@ impl EmailClient {
         req.json::<Message>().await.context("Error getting message")
     }
 
-    pub async fn get_sanitized_message(&self, message_id: &str) -> anyhow::Result<EmailMessage> {
+    pub async fn get_parsed_message(&self, message_id: &str) -> anyhow::Result<ParsedMessage> {
         let message = self.get_message_by_id(message_id).await?;
-        sanitize_message(message)
+        ParsedMessage::from_gmail_message(message)
     }
 
     // pub async fn get_threads(&self) -> anyhow::Result<Vec<Thread>> {
@@ -523,73 +523,6 @@ impl EmailClient {
     }
 }
 
-fn sanitize_message(msg: Message) -> anyhow::Result<EmailMessage> {
-    static RE_WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\r\t\n]+").unwrap());
-    static RE_LONG_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r" {2,}").unwrap());
-    static RE_NON_ASCII: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\x20-\x7E]").unwrap());
-    static RE_HTTP_LINK: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)").unwrap()
-    });
-
-    let id = msg.clone().id.unwrap_or_default();
-    let label_ids = msg.clone().label_ids.unwrap_or_default();
-    let thread_id = msg.thread_id.clone().unwrap_or_default();
-    let snippet = msg.clone().snippet.unwrap_or_default();
-    let history_id = msg.history_id.unwrap_or_default();
-    let internal_date = msg.internal_date.unwrap_or_default();
-    msg.raw
-        .as_ref()
-        .map(|input| {
-            let msg = MessageParser::default().parse(input);
-            let (subject, body, from) = msg.map_or((None, None, None), |m| {
-                let subject = m.subject().map(|s| s.to_string());
-                let body = m.body_text(0).map(|b| b.to_string());
-                let from = m
-                    .from()
-                    .and_then(|f| f.first().and_then(|x| x.address().map(|a| a.to_string())));
-
-                (subject, body, from)
-            });
-            let snippet = {
-                let s = RE_NON_ASCII.replace_all(&snippet, "");
-                let s = RE_WHITESPACE.replace_all(&s, " ");
-                let s = RE_LONG_SPACE.replace_all(&s, " ");
-                s.to_string()
-            };
-            let subject = subject.map(|s| {
-                let s = RE_NON_ASCII.replace_all(&s, "");
-                let s = RE_WHITESPACE.replace_all(&s, " ");
-                let s = RE_LONG_SPACE.replace_all(&s, " ");
-                s.to_string()
-            });
-            let body = body.map(|b| {
-                let b = RE_HTTP_LINK.replace_all(&b, "[LINK]");
-                let bytes = b.as_bytes();
-                let b: String = html2text::from_read(bytes, 400);
-                let b = RE_NON_ASCII.replace_all(&b, "");
-                let b = RE_WHITESPACE.replace_all(&b, " ");
-                let b = RE_LONG_SPACE.replace_all(&b, " ");
-                b.to_string()
-            });
-
-            EmailMessage {
-                id,
-                from,
-                label_ids,
-                thread_id,
-                history_id,
-                internal_date,
-                subject,
-                snippet,
-                body,
-            }
-        })
-        .context(format!(
-            "No raw message found in message response: {:?}",
-            msg
-        ))
-}
-
 fn build_label_update(
     user_labels: Vec<Label>,
     current_labels: Vec<String>,
@@ -700,19 +633,6 @@ pub struct MessageListOptions {
     pub max_results: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmailMessage {
-    pub id: String,
-    pub label_ids: Vec<String>,
-    pub thread_id: String,
-    pub history_id: u64,
-    pub internal_date: i64,
-    pub from: Option<String>,
-    pub subject: Option<String>,
-    pub snippet: String,
-    pub body: Option<String>,
-}
-
 enum EmailClientError {
     RateLimitExceeded,
     Unauthorized,
@@ -732,18 +652,10 @@ mod tests {
     use super::*;
     use crate::{
         email::client::{format_filter, get_required_labels},
-        model::{labels, user::UserCtrl},
+        model::labels,
         server_config::cfg,
-        testing::common::setup,
+        testing::common::setup_email_client,
     };
-
-    async fn setup_client(user_email: &str) -> EmailClient {
-        let (conn, http_client) = setup().await;
-        let user = UserCtrl::get_with_account_access_by_email(&conn, user_email)
-            .await
-            .unwrap();
-        EmailClient::new(http_client, conn, user).await.unwrap()
-    }
 
     #[test]
     fn test_gmail_url() {
@@ -810,8 +722,9 @@ mod tests {
 
         let message = serde_json::from_str::<Message>(&json).expect("Unable to parse json");
 
-        let sanitized = sanitize_message(message).expect("Unable to sanitize message");
-        let test = EmailMessage {
+        let sanitized =
+            ParsedMessage::from_gmail_message(message).expect("Unable to parse message");
+        let test = ParsedMessage {
                     id: "1921e8debe9a2256".to_string(),
         label_ids: vec![
             "Label_29".to_string(),
@@ -828,7 +741,6 @@ mod tests {
         subject: Some(
             "Remote Sr. JavaScript Engineer openings are available. Apply Now.".to_string(),
         ),
-        snippet: "Apply Now, Rachel and Charles are hiring for Remote Sr. JavaScript Engineer and Software Engineer roles! ".to_string(),
         body: Some(
             concat!(
                 "Apply Now, Rachel and Charles are hiring for Remote Sr. JavaScript Engineer and Software Engineer roles! [Jobot logo] ",
@@ -885,13 +797,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_trash_email() {
-        let client = setup_client("mpgrospamacc@gmail.com").await;
+        let client = setup_email_client("mpgrospamacc@gmail.com").await;
         client.trash_email("193936af5309bb57").await.unwrap();
     }
 
     #[tokio::test]
     async fn test_archive_email() {
-        let client = setup_client("mpgrospamacc@gmail.com").await;
+        let client = setup_email_client("mpgrospamacc@gmail.com").await;
         client.archive_email("193936af5309bb57").await.unwrap();
     }
 }

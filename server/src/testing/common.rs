@@ -2,7 +2,9 @@ use reqwest::Certificate;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::{env, path::PathBuf};
 
-use crate::{server_config::get_cert, HttpClient};
+use crate::{
+    email::client::EmailClient, model::user::UserCtrl, server_config::get_cert, HttpClient,
+};
 
 pub async fn setup() -> (DatabaseConnection, HttpClient) {
     dotenvy::dotenv().ok();
@@ -27,4 +29,12 @@ pub async fn setup() -> (DatabaseConnection, HttpClient) {
         .build()
         .unwrap();
     (conn, http_client)
+}
+
+pub async fn setup_email_client(user_email: &str) -> EmailClient {
+    let (conn, http_client) = setup().await;
+    let user = UserCtrl::get_with_account_access_by_email(&conn, user_email)
+        .await
+        .unwrap();
+    EmailClient::new(http_client, conn, user).await.unwrap()
 }

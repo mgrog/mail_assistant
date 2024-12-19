@@ -53,6 +53,7 @@ axum-extra = { version = "0.9.4", features = ["typed-header"] }
 http = "1.1.0"
 jsonwebtoken = "9.3.0"
 strum = { version = "0.26.3", features = ["derive"] }
+indoc = "2.0.5"
 
 [dependencies.sea-orm]
 version = "1.0.0-rc.5"

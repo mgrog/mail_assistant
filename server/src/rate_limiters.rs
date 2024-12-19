@@ -14,14 +14,12 @@ pub struct RateLimiters {
 }
 
 impl RateLimiters {
-    pub fn from_env() -> Self {
+    pub fn new(prompt_limit_per_sec: usize, interval_ms: usize, refill: usize) -> Self {
         let prompt = RateLimiter::builder()
-            .initial(cfg.api.prompt_limits.rate_limit_per_sec)
-            .interval(Duration::from_millis(
-                cfg.api.prompt_limits.refill_interval_ms as u64,
-            ))
-            .max(cfg.api.prompt_limits.rate_limit_per_sec)
-            .refill(cfg.api.prompt_limits.refill_amount)
+            .initial(prompt_limit_per_sec)
+            .interval(Duration::from_millis(interval_ms as u64))
+            .max(prompt_limit_per_sec)
+            .refill(refill)
             .build();
 
         Self {
@@ -29,6 +27,13 @@ impl RateLimiters {
             backoff: Arc::new(AtomicBool::new(false)),
             backoff_duration: Duration::from_secs(60),
         }
+    }
+
+    pub fn from_env() -> Self {
+        let prompt_limit_per_sec = cfg.api.prompt_limits.rate_limit_per_sec;
+        let interval_ms = cfg.api.prompt_limits.refill_interval_ms;
+        let refill = cfg.api.prompt_limits.refill_amount;
+        Self::new(prompt_limit_per_sec, interval_ms, refill)
     }
 
     pub async fn acquire_one(&self) {
