@@ -4,3 +4,5 @@ target
 .aws
 cert.pem
 ssl.pem
+/config/*
+!config/.gitkeep

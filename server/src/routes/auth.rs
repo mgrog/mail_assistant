@@ -3,7 +3,7 @@ extern crate google_gmail1 as gmail;
 use crate::{
     auth::{jwt::generate_redirect_auth_headers, session_store::AuthSessionStore},
     db_core::prelude::*,
-    model::user::UserCtrl,
+    model::user::{AccountAccess, UserCtrl},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -142,6 +142,16 @@ pub async fn handler_auth_gmail_callback(
         .email_address
         .ok_or(AuthCallbackError::NoEmailAddress)?;
 
+    match UserCtrl::get_with_account_access_by_email(&state.conn, email.as_str()).await {
+        Ok(user) if !user.needs_reauthentication && !user.access_is_expired() => {
+            let headers =
+                generate_redirect_auth_headers(email).map_err(|_| AuthCallbackError::Unexpected)?;
+            let url = cfg.frontend_url.clone();
+            return Ok((headers, Redirect::to(url.as_str())).into_response());
+        }
+        _ => {}
+    }
+
     User::insert(user::ActiveModel {
         id: ActiveValue::NotSet,
         email: ActiveValue::Set(email.clone()),
@@ -171,10 +181,11 @@ pub async fn handler_auth_gmail_callback(
         id: ActiveValue::NotSet,
         user_email: ActiveValue::Set(email.clone()),
         access_token: ActiveValue::Set(enc_access_code),
-        refresh_token: ActiveValue::Set("TEMP".to_string()),
+        refresh_token: ActiveValue::Unchanged("".to_string()),
         expires_at: ActiveValue::Set(DateTime::from(
             chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in as i64),
         )),
+        needs_reauthentication: ActiveValue::Set(false),
         created_at: ActiveValue::NotSet,
         updated_at: ActiveValue::NotSet,
     };
@@ -207,7 +218,7 @@ pub async fn handler_auth_gmail_callback(
     match user_account_access_insert_result {
         TryInsertResult::Inserted(_) | TryInsertResult::Conflicted => {
             let headers =
-                generate_redirect_auth_headers().map_err(|_| AuthCallbackError::Unexpected)?;
+                generate_redirect_auth_headers(email).map_err(|_| AuthCallbackError::Unexpected)?;
             url.path_segments_mut()
                 .unwrap()
                 .push(CONFIRM_CONNECTION_PATH);
@@ -291,6 +302,7 @@ pub(crate) enum AuthCallbackError {
     Unexpected,
     BadOauthResponse,
     NoEmailAddress,
+    NotFound,
 }
 
 impl IntoResponse for AuthCallbackError {
@@ -300,20 +312,18 @@ impl IntoResponse for AuthCallbackError {
             .unwrap()
             .push(CONFIRM_CONNECTION_PATH);
 
-        let headers = generate_redirect_auth_headers().unwrap();
-
         match self {
             AuthCallbackError::InvalidState => {
                 url.query_pairs_mut().append_pair("error", "state_mismatch");
-                (headers, Redirect::to(url.as_str())).into_response()
+                (Redirect::to(url.as_str())).into_response()
             }
             AuthCallbackError::NoEmailAddress => {
                 url.query_pairs_mut().append_pair("error", "no_email");
-                (headers, Redirect::to(url.as_str())).into_response()
+                (Redirect::to(url.as_str())).into_response()
             }
             _ => {
                 url.query_pairs_mut().append_pair("error", "unexpected");
-                (headers, Redirect::to(url.as_str())).into_response()
+                (Redirect::to(url.as_str())).into_response()
             }
         }
     }

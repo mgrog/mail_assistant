@@ -1,7 +1,7 @@
 use config::{Config, ConfigError};
 use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::{env, fs::File, io::Read, result::Result};
+use std::{env, fs::File, io::Read, path::Path, result::Result};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +124,7 @@ pub fn get_cert() -> Vec<u8> {
         if let Ok(dir) = env::var("APP_DIR") {
             format!("{}/cert.pem", dir)
         } else {
-            "server/cert.pem".to_string()
+            "config/cert.pem".to_string()
         }
     };
 
@@ -140,7 +140,10 @@ pub fn get_cert() -> Vec<u8> {
 lazy_static! {
     pub static ref cfg: ServerConfig = {
         let root = env::var("APP_DIR").unwrap_or_else(|_| {
-            env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR or APP_DIR is required")
+            let dir =
+                env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR or APP_DIR is required");
+            let dir = Path::new(&dir).parent().unwrap().display().to_string();
+            format!("{}/config", dir)
         });
         let path = format!("{root}/client_secret.toml");
         let mut gmail_config =

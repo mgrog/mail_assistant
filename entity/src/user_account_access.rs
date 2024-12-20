@@ -14,6 +14,7 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(unique)]
     pub user_email: String,
+    pub needs_reauthentication: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

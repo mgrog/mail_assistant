@@ -16,23 +16,24 @@ const COMPANY: &str = "mailclerk.io";
 pub const SHORT_TTL: usize = 5 * 60; // 5 minutes
 pub const LONG_TTL: usize = 24 * 60 * 60; // 24 hours
 const COOKIE_NAME: &str = "session";
-const DOMAIN: &str = "localhost";
+const DOMAIN: &str = "mailclerk.io";
 
-pub fn generate_redirect_jwt() -> Result<String, AuthError> {
+pub fn generate_redirect_jwt(user_email: String) -> Result<String, AuthError> {
     let claims = Claims {
-        sub: "redirect".to_string(),
+        sub: user_email,
         company: COMPANY.to_string(),
-        exp: Utc::now().timestamp() as usize + SHORT_TTL,
+        exp: Utc::now().timestamp() as usize + LONG_TTL,
     };
 
     jsonwebtoken::encode(&Header::default(), &claims, &KEYS.encoding)
         .map_err(|_| AuthError::TokenCreation)
 }
 
-pub fn generate_redirect_auth_headers() -> Result<HeaderMap, AuthError> {
-    let token = generate_redirect_jwt()?;
+pub fn generate_redirect_auth_headers(user_email: String) -> Result<HeaderMap, AuthError> {
+    let token = generate_redirect_jwt(user_email)?;
     let mut headers = HeaderMap::new();
-    let cookie = format!("{COOKIE_NAME}={token}; Domain={DOMAIN} SameSite=Lax; Path=/");
+    let cookie =
+        format!("{COOKIE_NAME}={token}; Domain={DOMAIN} SameSite=None; HttpOnly; Secure; Path=/");
     headers.insert(SET_COOKIE, cookie.parse().unwrap());
 
     Ok(headers)

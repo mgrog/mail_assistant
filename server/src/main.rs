@@ -206,12 +206,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    join_all(vec![
+    for join in join_all(vec![
         run_server(router, scheduler),
         // inbox_subscription_handle,
         processing_watch_handle,
     ])
-    .await;
+    .await
+    {
+        join.unwrap();
+    }
 
     Ok(())
 }
@@ -242,11 +245,13 @@ async fn shutdown_signal(mut scheduler: JobScheduler) {
         _ = ctrl_c => {
             scheduler.shutdown().await.unwrap();
             println!("Cleanups done, shutting down");
+            std::process::exit(0);
 
         },
         _ = terminate => {
             scheduler.shutdown().await.unwrap();
             println!("Cleanups done, shutting down");
+            std::process::exit(0);
         },
     }
 }
@@ -255,7 +260,7 @@ fn run_server(router: Router, scheduler: JobScheduler) -> JoinHandle<()> {
     tokio::spawn(async {
         // Start the server
         let port = env::var("PORT").unwrap_or("5006".to_string());
-        tracing::info!("Auto email running on http://0.0.0.0:{}", port);
+        tracing::info!("Mailclerk server running on http://0.0.0.0:{}", port);
         // check config
         println!("{}", *server_config::cfg);
 

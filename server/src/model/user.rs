@@ -217,6 +217,9 @@ pub trait AccountAccess {
     fn refresh_token(&self) -> anyhow::Result<String>;
     fn get_expires_at(&self) -> DateTimeWithTimeZone;
     fn set_new_access_token(&mut self, new_access_token: &str) -> anyhow::Result<()>;
+    fn access_is_expired(&self) -> bool {
+        self.get_expires_at() < chrono::Utc::now()
+    }
 }
 
 #[derive(FromQueryResult, Clone, Debug)]
@@ -231,6 +234,7 @@ pub struct UserWithAccountAccess {
     pub user_account_access_id: i32,
     access_token: String,
     refresh_token: String,
+    pub needs_reauthentication: bool,
     pub expires_at: DateTimeWithTimeZone,
 }
 
@@ -292,6 +296,7 @@ pub struct UserWithAccountAccessAndUsage {
     pub user_account_access_id: i32,
     access_token: String,
     refresh_token: String,
+    pub needs_reauthentication: bool,
     pub expires_at: DateTimeWithTimeZone,
     pub tokens_consumed: i64,
     pub last_rule_update_time: Option<DateTimeWithTimeZone>,
@@ -358,6 +363,7 @@ async fn update_account_access(
         expires_at: ActiveValue::Set(DateTime::from(
             chrono::Utc::now() + chrono::Duration::seconds(expires_in),
         )),
+        needs_reauthentication: ActiveValue::Set(false),
         ..Default::default()
     })
     .exec(conn)
@@ -372,15 +378,13 @@ pub async fn get_new_token(
     http_client: &HttpClient,
     conn: &DatabaseConnection,
     user: &mut impl AccountAccess,
-) -> anyhow::Result<String> {
+) -> AppResult<String> {
     let access_token = user.access_token()?;
     let refresh_token = user.refresh_token()?;
     let expires_at = user.get_expires_at();
 
     let new_access_token = if expires_at < chrono::Utc::now() {
-        let resp = auth::exchange_refresh_token(http_client, &refresh_token)
-            .await
-            .map_err(|e| anyhow::anyhow!("Error refreshing token: {:?}", e))?;
+        let resp = auth::exchange_refresh_token(http_client, &refresh_token).await?;
 
         update_account_access(conn, user, &resp.access_token, resp.expires_in as i64)
             .await
